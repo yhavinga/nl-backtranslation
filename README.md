@@ -11,7 +11,8 @@ published, and to the dates of its decisions. "Worker" and "host" are the 4 host
 ## Published datasets
 
 The pairs are published on Hugging Face as one dataset per source of original Dutch text. Each dataset card describes
-the selection from that source, the scores, the license and the known limitations of the pairs.
+the selection from that source, the scores, the license and the known limitations of the pairs. Together they form the collection
+[Dutch back-translation (nl→en)](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-6af45e2ba548b444c6362255).
 
 | dataset | Dutch source | license |
 |---|---|---|
