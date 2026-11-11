@@ -1,0 +1,59 @@
+#!/bin/bash
+# On every host of a TPU v4 slice: this worker's segments through TranslateGemma 27B in one direction, length class
+# after length class (translate.py beside this script), detached from ssh, each worker a TPU of its own 4 chips. Like
+# translate.sh of FLAN-nl, but with the languages as parameters and everything local in /dev/shm/translator; it runs in
+# FLAN-nl's venv (MaxText 0.2.5, /dev/shm/flan_nl/venv, built by its setup.sh), which it does not change.
+#   CKPT=gs://<bucket>/<dir>/translategemma-27b-maxtext LOGS=gs://<bucket>/<dir>/logs SOURCE=nl TARGET=en \
+#     SEGMENTS=gs://<bucket>/<dir>/select/segments-w{w}.parquet OUT=gs://<bucket>/<dir>/nl-en/w{w} NAME=nl_en \
+#     bash run_translate.sh
+# {w} in SEGMENTS and OUT is this worker's number. CKPT is the MaxText checkpoint of FLAN-nl's setup.sh convert. Log:
+# ~/logs/$NAME.log, a fresh file per start that ends in "EXIT <code>"; a copy goes to $LOGS. Shards land in
+# $OUT/<class>/; a second start skips every shard there.
+set -euo pipefail
+CKPT=${CKPT:?set CKPT to the gs:// directory of the MaxText checkpoint of TranslateGemma 27B}
+SHM=/dev/shm/translator
+PY=/dev/shm/flan_nl/venv/bin/python
+TOK=/dev/shm/flan_nl/tokenizer-27b
+CODE=$(cd "$(dirname "$0")" && pwd)
+WORKER=$(hostname | sed 's/.*-w-//')
+SOURCE=${SOURCE:?nl or en}
+TARGET=${TARGET:?en or nl}
+SEGMENTS=${SEGMENTS:?the segments of a worker, w in braces for its number}
+OUT=${OUT:?the bucket directory of its shards, w in braces for its number}
+NAME=${NAME:?the name of the log}
+CLASSES=${CLASSES:-tiny small medium long xlong xxlong}
+# Where the log's copy goes
+LOGS=${LOGS:?set LOGS to a gs:// directory for the copies of the logs}
+EXTRA=${EXTRA:-}
+SEGMENTS=${SEGMENTS//\{w\}/$WORKER}
+OUT=${OUT//\{w\}/$WORKER}
+
+[ -x "$PY" ] || { echo "$(hostname): no $PY (setup.sh of FLAN-nl)"; exit 1; }
+[ -s "$TOK/tokenizer.json" ] || { echo "$(hostname): no tokenizer in $TOK (setup.sh of FLAN-nl)"; exit 1; }
+[ -s "$CODE/translate.py" ] || { echo "$(hostname): no translate.py beside $0"; exit 1; }
+[ -z "$(sudo lsof -t /dev/accel* /dev/vfio/* 2> /dev/null)" ] || { echo "$(hostname): the TPU is in use"; exit 1; }
+gsutil -q stat "$CKPT/done.txt" || { echo "$(hostname): $CKPT has no done.txt"; exit 1; }
+mkdir -p ~/logs "$SHM/segments"
+local_segments=$SHM/segments/$NAME-$(basename "$SEGMENTS")
+gsutil -q cp "$SEGMENTS" "$local_segments"
+
+# A host of the v4-32 as a TPU of its own: without these variables JAX takes the slice from the TPU metadata and waits
+# for the other hosts. MaxText runs with skip_jax_distributed_system, so nothing initializes a multi-process runtime.
+cat > ~/run_$NAME.sh <<EOF
+set -uo pipefail
+export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
+export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
+export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
+export JAX_COMPILATION_CACHE_DIR=$SHM/jax_cache
+# MaxText 0.2.5 dumps every program to /tmp/xla_dump on the boot disk when XLA_FLAGS is empty; libtpu's logs go to /dev/shm
+export XLA_FLAGS=--xla_dump_hlo_as_text=false TPU_LOG_DIR=$SHM/tpu_logs
+timeout 600 $PY -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())" || { echo "preflight failed: not 4 chips of one process"; exit 2; }
+echo "\$(date +%H:%M:%S) $(hostname): $SOURCE -> $TARGET, $SEGMENTS -> $OUT with $CKPT"
+for class in $CLASSES; do
+  $PY -u $CODE/translate.py --segments $local_segments --out $OUT/\$class --ckpt $CKPT/0/items \
+    --tokenizer $TOK --model gemma3-27b --length-class \$class --source-lang $SOURCE --target-lang $TARGET \
+    --work-dir $SHM $EXTRA || exit \$?
+done
+EOF
+setsid nohup bash -c "bash ~/run_$NAME.sh > ~/logs/$NAME.log 2>&1; echo EXIT \$? >> ~/logs/$NAME.log; gsutil -q cp ~/logs/$NAME.log $LOGS/$NAME-w$WORKER.log" > /dev/null 2>&1 < /dev/null &
+echo "started $NAME on $(hostname): ~/logs/$NAME.log, shards in $OUT"
