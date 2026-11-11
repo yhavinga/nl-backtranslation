@@ -5,35 +5,31 @@ passages of original Dutch text, has Gemma 4 31B judge them, translates them int
 Dutch with TranslateGemma 27B on TPU, and scores every pair (hard checks, chrF, MetricX-24 in quality-estimation mode).
 A training pair is the synthetic English as the source and the original Dutch as the target.
 
-The FineWeb-2 part of the pairs is published as the Hugging Face dataset
-[yhavinga/fineweb-2-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/fineweb-2-nl-backtranslated-en).
-Its dataset card describes the selection, the scores and the known limitations of the pairs.
+The comments in the code refer to the design of the experiment the pairs were made for ("design §3"), which is not
+published, and to the dates of its decisions. "Worker" and "host" are the 4 hosts of a TPU v4-32.
 
-## Provenance
+## Published datasets
 
-Extracted from [yhavinga/mbert-jax](https://github.com/yhavinga/mbert-jax) @ `62e7a5d`
-(`62e7a5d59af1800dd0687062a7cc97dd6aa44637`, branch `en-nl-translator`): `experiments/en-nl-translator/`,
-`experiments/en-nl-judge/` and `experiments/flan-nl/translate.py`, with their tests. The changes:
+The pairs are published on Hugging Face as one dataset per source of original Dutch text. Each dataset card describes
+the selection from that source, the scores, the license and the known limitations of the pairs.
 
-- `publish.py` holds only the two text checks (`decode_loop`, `english_left`) of FLAN-nl's `publish.py`, copied
-  unchanged from [yhavinga/flan-nl](https://github.com/yhavinga/flan-nl); the rest of that file builds FLAN-nl.
-- The files are in one directory (the judge in `gemma_judge/`), and the imports and the tests' paths follow that.
-- Bucket names and paths of the experiment are required arguments or variables without a default: `CKPT` and `LOGS`
-  of the run scripts, `CKPT` of `gemma_judge/setup.sh`, `--root` of `metricx_qe.py`, `--data-dir` of
-  `mainset.py report`. Local working directories under `/dev/shm` stay as they were.
-- Names of people are left out of the comments; one evaluation set of `mainset.py eval-rows` is called `review`.
-- `ruff` sorted three import blocks.
+| dataset | Dutch source | license |
+|---|---|---|
+| [yhavinga/fineweb-2-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/fineweb-2-nl-backtranslated-en) | web text of `.nl` and `.be` domains (FineWeb-2 `nld_Latn`) | ODC-By 1.0 |
+| [yhavinga/handelingen-tweede-kamer-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/handelingen-tweede-kamer-nl-backtranslated-en) | debates of the Tweede Kamer (`yhavinga/dutch-handelingen-modern`), with the speaking turns before a passage as context (config `context_turns`) | CC0 1.0 |
+| [yhavinga/openraadsinformatie-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/openraadsinformatie-nl-backtranslated-en) | documents of municipal, provincial and water-board councils (GPT-NL collection `openraadsinformatie`) | CC BY 4.0 |
+| [yhavinga/rijksoverheid-websites-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/rijksoverheid-websites-nl-backtranslated-en) | websites of the Dutch central government (GPT-NL collection `dienst_publiek_en_communicatie`) | CC BY 4.0 |
+| [yhavinga/rechtspraak-nl-backtranslated-en](https://huggingface.co/datasets/yhavinga/rechtspraak-nl-backtranslated-en) | court rulings of uitspraken.rechtspraak.nl (GPT-NL collection `de_rechtspraak`) | CC BY 4.0 |
 
-The comments in the code refer to the design of the experiment the pairs come from ("design §3"), which is not
-published, and to the dates of its decisions. "Worker" and "host" are the 4 hosts of a TPU v4-32. The code also covers
-the sources of that experiment besides FineWeb-2: the Handelingen of the Tweede Kamer and three collections of GPT-NL.
+The English translations in all five were made with TranslateGemma and fall under the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms) as well.
 
 ## Sources and models
 
 | what | Hugging Face id or URL | revision |
 |---|---|---|
 | Dutch web text | `HuggingFaceFW/fineweb-2` (`nld_Latn`) | `af9c13333eb981300149d5ca60a8e9d659b276b9` |
-| Tweede Kamer debates | `yhavinga/dutch-handelingen-modern` | `abdba14ac9271b6d43ccefe6143202b7bdd4e900` |
+| Tweede Kamer debates | `yhavinga/dutch-handelingen-modern` | `abdba14ac9271b6d43ccefe6143202b7bdd4e900` (see below) |
 | GPT-NL council reports, government information, court rulings | `tvosch/GPT-NL-propella-annotations` | `db7f5947be4445e396aa0dd0df52ab6c1f418efc` |
 | translation model | `google/translategemma-27b-it` | `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2` |
 | judge of the Dutch passages | `google/gemma-4-31B-it` | `842da3794eaa0b77d5f08bae87a17459d91ff475` |
@@ -41,6 +37,10 @@ the sources of that experiment besides FineWeb-2: the Handelingen of the Tweede 
 | MetricX's tokenizer | `google/mt5-xl` | `63fc6450d80515b48e026b69ef2fbbd426433e84` |
 | word list | `OpenTaal/opentaal-wordlist` (GitHub) | `b250510dda431785f962019167d1415198ff3905` |
 | idiom list | kaikki.org's extract of the Dutch entries of the English Wiktionary | not versioned; `setup.sh` records its Last-Modified and sha256 |
+
+`select_passages.py` pins `yhavinga/dutch-handelingen-modern` at `abdba14`, the revision the published selection read.
+The Hub no longer has that revision: the dataset's history was squashed into one commit, `ef8e7e5`. The published
+Handelingen passages were checked against `ef8e7e5` (same agenda items, dates, speakers and turn texts).
 
 The test sets that no passage may share a 13-gram with (`mainset.py testsets`, `TESTSETS`): DBRD, SICK-NL, FLORES-200
 devtest, WMT24++ en-nl_NL and NTREX-128, each at a fixed revision. They are read only as a block list.
@@ -93,7 +93,7 @@ number); the other steps run on one host.
    python mainset.py testsets --out testsets
    ```
 
-2. **Pools of candidate passages** (`select_passages.py select`). The FineWeb-2 pool of the published pairs:
+2. **Pools of candidate passages** (`select_passages.py select`). The FineWeb-2 pool:
 
    ```
    python select_passages.py select --out pool-fineweb --idioms $RES/idioms.json --wordlist $RES/opentaal-wordlist.txt \
@@ -179,14 +179,14 @@ python -m pytest -q
 ruff check --line-length 100 --target-version py310 --select E,F,I,W --ignore E501 .
 ```
 
-The test of `translate.py`'s LoRA merge (`--lora`) is not here: it needs the fine-tune code of mbert-jax
-(`sft_lora.py`) and MaxText.
+`translate.py`'s LoRA merge (`--lora`) has no test here: it needs an adapter of a fine-tune script that is not in
+this repository (`sft_lora.py`) and MaxText.
 
 ## Licences
 
 - **Code**: Apache License 2.0 (`LICENSE`).
 - **FineWeb-2**: ODC-By 1.0; its use is also subject to Common Crawl's Terms of Use.
-- **GPT-NL propella annotations**: CC BY 4.0. **dutch-handelingen-modern**: CC0 1.0.
+- **GPT-NL Public Corpus** and **GPT-NL propella annotations**: CC BY 4.0. **dutch-handelingen-modern**: CC0 1.0.
 - **TranslateGemma**: provided under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms). Section 3.3 says:
   "Google claims no rights in Outputs you generate using Gemma." If you train a model on the translations, read the
   definition of "Model Derivatives" in Section 1.1(e) of those terms.
