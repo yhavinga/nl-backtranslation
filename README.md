@@ -5,6 +5,13 @@ passages of original Dutch text, has Gemma 4 31B judge them, translates them int
 Dutch with TranslateGemma 27B on TPU, and scores every pair (hard checks, chrF, MetricX-24 in quality-estimation mode).
 A training pair is the synthetic English as the source and the original Dutch as the target.
 
+TranslateGemma's English is wordier than a human translation (a median of 0.960 Dutch words per English word on 200
+random passages, against about 1.06 for human translations), and a translator trained on it learns to compress.
+`gemma4_bt/` therefore translates the same 271,710 Dutch passages into English once more, with Gemma 4 31B-it and a
+prompt chosen by a rule fixed in advance (see [Gemma 4 back-translation](#gemma-4-back-translation)). It adds a
+column `en_gemma4` and its checks to every row of the five datasets; the TranslateGemma pipeline and its columns stay
+as they are.
+
 The comments in the code refer to the design of the experiment the pairs were made for ("design §3"), which is not
 published, and to the dates of its decisions. "Worker" and "host" are the 4 hosts of a TPU v4-32.
 
@@ -33,7 +40,7 @@ The English translations in all five were made with TranslateGemma and fall unde
 | Tweede Kamer debates | `yhavinga/dutch-handelingen-modern` | `abdba14ac9271b6d43ccefe6143202b7bdd4e900` (see below) |
 | GPT-NL council reports, government information, court rulings | `tvosch/GPT-NL-propella-annotations` | `db7f5947be4445e396aa0dd0df52ab6c1f418efc` |
 | translation model | `google/translategemma-27b-it` | `7d10f0b72f89a2d0f268cea30727d8b77c0d25c2` |
-| judge of the Dutch passages | `google/gemma-4-31B-it` | `842da3794eaa0b77d5f08bae87a17459d91ff475` |
+| judge of the Dutch passages; translation model of `gemma4_bt/` | `google/gemma-4-31B-it` | `842da3794eaa0b77d5f08bae87a17459d91ff475` |
 | quality estimation | `google/metricx-24-hybrid-xxl-v2p6-bfloat16` | `3d9c6f7fd11b58d3eceeb68ee39fe7d2c761ee20` |
 | MetricX's tokenizer | `google/mt5-xl` | `63fc6450d80515b48e026b69ef2fbbd426433e84` |
 | word list | `OpenTaal/opentaal-wordlist` (GitHub) | `b250510dda431785f962019167d1415198ff3905` |
@@ -47,7 +54,9 @@ The test sets that no passage may share a 13-gram with (`mainset.py testsets`, `
 devtest, WMT24++ en-nl_NL and NTREX-128, each at a fixed revision. They are read only as a block list.
 
 Software: MaxText 0.2.5 (both models run in MaxText on TPU), JAX 0.11.1, `tokenizers` 0.23.2, `sacrebleu` 2.5.1,
-`langid` 1.1.6 (the versions `setup.sh` installs).
+`langid` 1.1.6 (the versions `setup.sh` installs). `gemma4_bt/` runs Gemma 4 in MaxText from git: commit `2249474` of
+[github.com/yhavinga/maxtext](https://github.com/yhavinga/maxtext) (MaxText's main of 9 Nov 2026, `d1c0d0a`, with the
+NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/setup.sh`.
 
 ## Files
 
@@ -63,6 +72,10 @@ Software: MaxText 0.2.5 (both models run in MaxText on TPU), JAX 0.11.1, `tokeni
 | `gemma_judge/judge.py`, `gemma_judge/run_source_judge.sh` | Gemma 4 31B-it as a yes/no judge: the source check, the origin question and the topic of a Dutch passage, or a translation pair |
 | `gemma_judge/data.py`, `gemma_judge/report.py`, `gemma_judge/hf_reference.py` | the judge's calibration: Europarl paragraphs with deterministic errors, summaries of its scores, and its numbers from `transformers` |
 | `setup.sh`, `gemma_judge/setup.sh` | the environments on the TPU hosts, the word list and the idiom source, and Gemma 4 31B-it as a MaxText checkpoint |
+| `gemma4_bt/bt_gemma4.py` | the Gemma 4 back-translation: the source datasets (`fetch`), the probe and the rule that chooses the prompt (`probeplan`, `select`), the units of the full run (`plan`), claiming and translating them (`work`, `status`), the merged dataset on Hugging Face (`publish`, `final`, `report`, `card`) and one dataset per source (`datasets`) |
+| `gemma4_bt/gemma4_engine.py`, `gemma4_bt/models.yml` | Gemma 4 31B-it in MaxText on 4 chips (greedy, continuous batching); the prompts, the length classes and the decode slots |
+| `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips; its environment in `/dev/shm/bt_gemma4` |
+| `gemma4_bt/keeper.sh`, `gemma4_bt/stage.sh` | on a control machine: the spot VMs of every region requested, started, restarted and deleted, and the units of the other regions announced; the code put into each region's bucket |
 | `tests/` | tests on made-up data; no network, model or TPU |
 
 ## Requirements
@@ -77,6 +90,9 @@ Software: MaxText 0.2.5 (both models run in MaxText on TPU), JAX 0.11.1, `tokeni
   `/dev/shm/judge/venv`; with `convert` it also converts Gemma 4 31B-it to that checkpoint.
 - **TPU**: Cloud TPU VMs with v4 hosts of 4 chips (each host runs as a TPU of its own), `gsutil`, and a `gs://`
   directory for checkpoints, inputs and outputs. The run scripts read the worker number from the hostname (`...-w-<N>`).
+- **Gemma 4 back-translation**: spot v6e-8 TPU VMs in one or more regions, a `gs://` directory in a bucket of each
+  region, Gemma 4 31B-it as a MaxText checkpoint in each of those regions (`gemma_judge/setup.sh convert`), a private
+  dataset on Hugging Face for the merged output, and a control machine with `gcloud` and `gsutil` for `keeper.sh`.
 - **Hugging Face token**: TranslateGemma is a gated model. Put a token in `~/.cache/huggingface/token` on each machine
   (for example with `hf auth login`); the scripts never take it as an argument and never print it.
 
@@ -169,10 +185,75 @@ number); the other steps run on one host.
 Nothing is filtered after translation: a training set is a query on `pairs.parquet` (for example `hard_fails` empty and
 `qe_en_nl` <= 7.5).
 
+## Gemma 4 back-translation
+
+`gemma4_bt/` translates the 271,710 Dutch passages and context turns of the five datasets (`bt_gemma4.py`, `SOURCES`:
+the revisions of 11 Nov 2026) from Dutch into English again, with `google/gemma-4-31B-it` at `842da37`, greedy, in
+MaxText on spot v6e-8 VMs. Gemma 4 31B allows at most 4-way tensor parallelism, so each VM runs two processes of 4
+chips. Nothing is filtered out: every row keeps all columns of its source dataset (TranslateGemma's English stays in
+`en`) and gets `en_gemma4`, the checks of the pair (`nl`, `en_gemma4`) as `gemma4_*` columns (the hard checks of
+`pairs.py`, and `chatter`: an introduction or a note around the translation), and `tg_word_ratio`.
+
+### The prompt
+
+The prompts are in `gemma4_bt/models.yml`, each as one user turn in Gemma 4's chat template with an empty thought
+channel. `natural-v1` asks for natural, complete and faithful English; in an earlier pilot it added formatting the
+source does not have. `natural-v1-fmt` adds one sentence against that, and `natural-v1-fmt-len` one more on length.
+Before the probe translated anything, the rule that picks one was fixed (`bt_gemma4.choose`): on the 200 passages of
+the stratum `random` (40 per source), a prompt is eligible when at most 1.5% of its pairs fail a hard check; of those,
+the one whose median Dutch words per English word is closest to 1.06 (human translations); where the distances differ
+by less than 0.01, the one with fewer failures. The probe of 13 Nov 2026:
+
+| prompt | pairs | hard-check failures | median Dutch words per English word |
+|---|---:|---:|---:|
+| `natural-v1` | 200 | 7 (3.5%) | 1.018 |
+| `natural-v1-fmt` | 200 | 0 (0.0%) | 1.000 |
+| `natural-v1-fmt-len` | 200 | 2 (1.0%) | 1.000 |
+
+`natural-v1` was not eligible; the other two were equally close to 1.06, and `natural-v1-fmt` had fewer failures, so
+it was chosen. TranslateGemma's English on the same 200 passages had a median of 0.960. No prompt reached 1.06: the
+sentence on length did not change the median.
+
+### Steps
+
+`G1`, `G2`, ... are the `gs://` directories of the run, one in a bucket of each region; `C1`, `C2`, ... Gemma 4's
+MaxText checkpoints in those regions (`<checkpoint>/0/items`); `REPO` the private Hugging Face dataset of the merged
+output.
+
+1. **Stage the code** (from a clean checkout): `bash gemma4_bt/stage.sh $G1 $G2`. With `PILOT=<file>` also the ids of
+   an earlier pilot (`bt_gemma4.py probeplan --pilot`: its sample is left out of the probe's strata, and its
+   translations that failed `structure` form the stratum `structure`).
+2. **Mark the region of the probe**: `echo | gsutil cp - $G1/probe/run-here`.
+3. **Start the keeper** on the control machine. `TPU_UP` and `TPU_DOWN` are your commands to request and delete a spot
+   v6e-8 (the keeper calls them with `--accelerator v6e-8 --zone <zone> --name <name> [--replace]` and
+   `--name <name>`); put a quota guard there.
+
+   ```
+   PROJECT=<project> VMS="bt-a-0:us-east1-d bt-b-0:europe-west4-a" REPO=$REPO \
+       REGIONS="us-east1=$G1,forward,$C1 europe-west4=$G2,backward,$C2" TPU_UP="<command>" TPU_DOWN="<command>" \
+       bash gemma4_bt/keeper.sh
+   ```
+
+   Each VM runs `run_bt_gemma4.sh all`: `setup.sh`, the source datasets from Hugging Face (`fetch`), the plan (558
+   units of at most 512 consecutive ids of one source, split and length class; every VM checks its plan's hash
+   against `full/plan-hash.txt`), and in the probe's region the probe and `selection.md`.
+4. **Set the prompt** the rule chose, in every region: `echo natural-v1-fmt | gsutil cp - $G1/full/prompt.txt` (and
+   `$G2`). The VMs then take units, one region forwards and the other backwards, and each region's publisher puts its
+   shards into `REPO` as `<part>/<split>-<class>-<k>.parquet`. Once all 558 are there, `final` writes the report to
+   `full/report/`, and the keeper deletes the VMs and ends.
+5. **One dataset per source**, on any machine with a copy of `REPO` and of the sources: `python gemma4_bt/bt_gemma4.py
+   fetch --out sources`, then `python gemma4_bt/bt_gemma4.py datasets --data <copy of REPO> --sources sources --out
+   per-source` writes per source the files of the source dataset (`data/`, and `context_turns/` for the Handelingen),
+   each with the same rows in the same order and the new columns; it checks that every source column is unchanged.
+
+The length of a passage is a setting: a set of longer passages needs length classes of its own in `models.yml` (a new
+model entry) and `bt_gemma4.py plan --model <entry> --max-source <tokens>`.
+
 ## Tests
 
-The tests use made-up data and need `pytest`, `numpy`, `pyarrow`, `sacrebleu`, `tokenizers` and `langid==1.1.6`; two of
-them skip without `jax` or without TranslateGemma's tokenizer (`TRANSLATEGEMMA_TOKENIZER`). The code is checked with
+The tests use made-up data and need `pytest`, `numpy`, `pyarrow`, `pyyaml`, `sacrebleu`, `tokenizers` and
+`langid==1.1.6`; three of them skip without `jax`, without TranslateGemma's tokenizer (`TRANSLATEGEMMA_TOKENIZER`) or
+without Gemma 4's (`GEMMA4_TOKENIZER`; with `transformers`). The code is checked with
 ruff's pycodestyle, pyflakes and isort rules:
 
 ```

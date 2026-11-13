@@ -1,0 +1,67 @@
+# The model of the Gemma 4 back-translation (bt_gemma4.py, gemma4_engine.py) and its prompts.
+#
+# A model: the MaxText config (maxtext_model), the Hugging Face repo and revision it was converted from, the chips one
+# process uses (tensor parallel over all of them), the stop tokens (generation_config.json of the Hugging Face repo),
+# its default prompt, the strings around one user turn in the model's own chat format (turn), the engine's shapes per
+# length class and the decode slots per class. The checkpoint is an argument (--ckpt), never a setting here.
+#
+# A length class takes the segments of more source tokens than the class before it, up to max_source; a prompt is
+# padded to the first prefill length that holds it, and decoding stops at max_decode tokens; max_target_length is the
+# largest prefill length plus max_decode. A step attends over the whole cache of every slot, prefill and decode part,
+# so its cost grows with prefill + decode: the classes keep that length close to what their segments need.
+
+prompts:
+  # Every prompt is one user turn in the model's own chat template; {source} and {target} are language names, {text}
+  # the passage (stripped). natural-v1 asks for complete, faithful and natural text. In an earlier pilot it added
+  # formatting the source does not have (hard checks 4.9% of the pilot's uniform sample, nearly all `structure`: line
+  # and paragraph breaks, italics, lists), and its English was still somewhat longer than a human translation (median
+  # 1.019 Dutch words per English word, human ~1.06). natural-v1-fmt is natural-v1 with one sentence
+  # against added formatting; natural-v1-fmt-len adds one sentence on length. In Gemma 4's turn they take 114 and 135
+  # tokens beside the source, which the classes of gemma4-31b-bt leave room for (160-192).
+  natural-v1:
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
+
+
+      {text}
+  natural-v1-fmt:
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Do not add line breaks, paragraphs, lists, headings, emphasis, Markdown or quotation marks that the source does not have. Output only the translation, without explanation or commentary.
+
+
+      {text}
+  natural-v1-fmt-len:
+    plain: |-
+      Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Make the {target} about as long as a professional human translation would be; do not add words or explanations. Keep the paragraphs, line breaks and formatting. Do not add line breaks, paragraphs, lists, headings, emphasis, Markdown or quotation marks that the source does not have. Output only the translation, without explanation or commentary.
+
+
+      {text}
+
+models:
+  # Gemma 4 31B-it, converted by MaxText's to_maxtext (gemma_judge/setup.sh convert). Its 4 KV heads of the global
+  # layers allow at most 4-way tensor parallelism, so one process takes 4 chips: half a v6e-8. Weights 61.4 GB, 15.4 GB
+  # a chip; KV of a token 50 local layers x 16 heads x 256 x 2 x 2 + 10 global x 4 x 512 x 2 x 2 = 0.90 MB, 0.23 MB a
+  # chip; ~15 GB a chip left of a v6e chip's 32 GB. The slots hold ~45k slot-tokens (~10 GB a chip), ~70% of what is
+  # left; tiny has 160 slots for its longer prefill.
+  #
+  # The classes are the pipeline's length setting: a set of longer passages gets classes of its own in a model entry
+  # of its own here (max_source, the prefill lengths and max_decode) and bt_gemma4.py plan --max-source. nl->en gives
+  # ~0.6 output tokens per source token, so max_decode at 1.0-1.2 x max_source leaves a wide margin; the largest prefill
+  # must lie at least 160 tokens above max_source (the prompt takes up to 135).
+  gemma4-31b-bt:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
+    chips: 4
+    eos_ids: [1, 106, 50]  # generation_config.json: <eos>, <turn|>, and 50
+    prompt: natural-v1-fmt
+    # The chat template with one user turn, add_generation_prompt and enable_thinking at its default (false), which
+    # closes an empty thought channel; the template trims the user text. Checked against apply_chat_template.
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      tiny: {max_source: 32, prefill_lengths: [192], max_decode: 96}
+      small: {max_source: 128, prefill_lengths: [192, 320], max_decode: 256}
+      medium: {max_source: 256, prefill_lengths: [320, 448], max_decode: 448}
+      long: {max_source: 384, prefill_lengths: [448, 576], max_decode: 640}
+      xlong: {max_source: 512, prefill_lengths: [576, 704], max_decode: 832}
+    slots: {tiny: 160, small: 80, medium: 52, long: 36, xlong: 28}
