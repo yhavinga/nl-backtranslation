@@ -88,9 +88,9 @@ NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/
 | `gemma_judge/judge.py`, `gemma_judge/run_source_judge.sh` | Gemma 4 31B-it as a yes/no judge: the source check, the origin question and the topic of a Dutch passage, or a translation pair |
 | `gemma_judge/data.py`, `gemma_judge/report.py`, `gemma_judge/hf_reference.py` | the judge's calibration: Europarl paragraphs with deterministic errors, summaries of its scores, and its numbers from `transformers` |
 | `setup.sh`, `gemma_judge/setup.sh` | the environments on the TPU hosts, the word list and the idiom source, and Gemma 4 31B-it as a MaxText checkpoint |
-| `gemma4_bt/bt_gemma4.py` | the Gemma 4 back-translation: the source datasets (`fetch`), the probe and the rule that chooses the prompt (`probeplan`, `select`), the units of the full run (`plan`), claiming and translating them (`work`, `status`), the merged dataset on Hugging Face (`publish`, `final`, `report`, `card`) and one dataset per source (`datasets`) |
-| `gemma4_bt/gemma4_engine.py`, `gemma4_bt/models.yml` | Gemma 4 31B-it in MaxText on 4 chips (greedy, continuous batching); the prompts, the length classes and the decode slots |
-| `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips; its environment in `/dev/shm/bt_gemma4` |
+| `gemma4_bt/bt_gemma4.py` | the Gemma 4 back-translation: the source datasets (`fetch`), the probe and the rule that chooses the prompt (`probeplan`, `select`), the units of the full run (`plan`), claiming and translating them (`work`, `status`), the merged dataset on Hugging Face (`publish`, `final`, `report`, `card`), one dataset per source (`datasets`), and the round trip of its English back into Dutch (`fetch --roundtrip`, `plan --text en`, `roundtrip`) |
+| `gemma4_bt/gemma4_engine.py`, `gemma4_bt/models.yml` | Gemma 4 31B-it in MaxText on 4 chips (greedy, continuous batching); the prompts, the length classes and the decode slots of both directions |
+| `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips (`all`, or `roundtrip`); its environment in `/dev/shm/bt_gemma4` |
 | `gemma4_bt/keeper.sh`, `gemma4_bt/stage.sh` | on a control machine: the spot VMs of every region requested, started, restarted and deleted, and the units of the other regions announced; the code put into each region's bucket |
 | `tests/` | tests on made-up data; no network, model or TPU |
 
@@ -280,13 +280,36 @@ output.
    | `word_ratio`, `char_ratio` | Dutch words per English word (split on whitespace); Dutch characters over English characters |
    | `region`, `vm`, `time` | where and when the translation was made |
 
+6. **The round trip**: Gemma 4 translates the English `en` of the five `-gemma4` datasets back into Dutch, and every
+   row gets chrF of that back-translation against the original `nl` and the checks of the back-translation. The run
+   is that of steps 1-4 in directories of its own (`G1`, `G2`, ... of the round trip, a private dataset `REPO` for its
+   shards), without a probe: stage the code, put the prompt into every region (`echo natural-v1-fmt | gsutil cp -
+   $G1/full/prompt.txt`) and start the keeper with `STEP=roundtrip`. Each VM then runs `run_bt_gemma4.sh roundtrip`:
+   `fetch --roundtrip` (the `-gemma4` datasets at the revisions of `ROUNDTRIP_SOURCES`), `plan --text en` (the units
+   on the Gemma 4 tokens of `en`, in the length classes of the model `gemma4-31b-rt`; the plan stops if the original
+   Dutch of a passage, times 1.25, does not fit the decode limit of its class), and the units with the prompt
+   `natural-v1-fmt` from English into Dutch, greedy; the publisher puts every shard into `REPO` as it is. Then, on
+   any machine with a copy of `REPO` and of the `-gemma4` datasets (`fetch --roundtrip --out gemma4`):
+   `python gemma4_bt/bt_gemma4.py roundtrip --data gemma4 --shards <copy of REPO> --out roundtrip --processes 32`
+   writes every file of the `-gemma4` datasets with the same rows, every column unchanged, and these columns
+   appended, and `roundtrip/roundtrip.json` with their numbers per source, config and split:
+
+   | column | meaning |
+   |---|---|
+   | `nl_back` | Gemma 4 31B-it's Dutch translation of `en` (greedy; the back-translation) |
+   | `back_tokens_out` | Gemma 4 tokens of that output (with the stop token) |
+   | `back_ended` | the back-translation stopped by itself |
+   | `chrf` | sentence-level chrF of `nl_back` against `nl`: `sacrebleu.sentence_chrf(nl_back, [nl])` of sacrebleu 2.5.1 with its defaults (chrF2: character n-grams up to 6, no word n-grams, beta 2), rounded to 3 decimals; the same as `chrf` of the TranslateGemma datasets (`pairs.back_measures`) |
+   | `back_decode_loop`, `back_structure` | `nl_back` repeats itself where `en` does not; the formatting categories that differ between `en` and `nl_back` (as in the TranslateGemma datasets) |
+   | `back_english_left`, `back_chatter` | a stretch of `en` left in `nl_back` (`publish.english_left`); an introduction or a note around `nl_back` |
+
 The length of a passage is a setting: a set of longer passages needs length classes of its own in `models.yml` (a new
 model entry) and `bt_gemma4.py plan --model <entry> --max-source <tokens>`.
 
 ## Tests
 
 The tests use made-up data and need `pytest`, `numpy`, `pyarrow`, `pyyaml`, `sacrebleu`, `tokenizers` and
-`langid==1.1.6`; three of them skip without `jax`, without TranslateGemma's tokenizer (`TRANSLATEGEMMA_TOKENIZER`) or
+`langid==1.1.6`; four of them skip without `jax`, without TranslateGemma's tokenizer (`TRANSLATEGEMMA_TOKENIZER`) or
 without Gemma 4's (`GEMMA4_TOKENIZER`; with `transformers`). The code is checked with
 ruff's pycodestyle, pyflakes and isort rules:
 

@@ -16,6 +16,9 @@
 #    both halves take units of the full plan in this region's direction; the publisher puts this region's shards on
 #    Hugging Face
 # 4. final, once every unit is on Hugging Face: the report (bt_gemma4.py final, under a lease, once a region)
+# run_bt_gemma4.sh roundtrip: the same for the round trip (bt_gemma4.py docstring, step 4), in a directory O of its
+# own: the -gemma4 datasets (fetch --roundtrip) and their plan on the English (plan --text en), no probe; the units
+# translate en back into Dutch, the publisher puts the shards into REPO as they are, and final makes no report
 # A preempted VM loses at most a unit a half. The v6e-8 runs as two TPUs of 4 chips (Gemma 4 31B allows at most 4-way
 # tensor parallelism). Needs ~/.cache/huggingface/token (keeper.sh puts it there through stdin).
 set -euo pipefail
@@ -102,17 +105,22 @@ probe_qe() {  # MetricX-24-QE of the probe in both directions (for the report on
 
 step=${1:-}
 case $step in
-all)
-  log "setup $(hostname) $REGION $DIRECTION"
+all) DATA=$D/hf; PLAN=$D/plan; FETCH=(); TEXT=nl ;;
+roundtrip) DATA=$D/hf-rt; PLAN=$D/plan-rt; FETCH=(--roundtrip); TEXT=en ;;
+*) echo "usage: run_bt_gemma4.sh all|roundtrip (with O, DIRECTION, CKPT and REPO set)"; exit 1 ;;
+esac
+case $step in
+all|roundtrip)
+  log "setup $(hostname) $REGION $DIRECTION $step"
   HF_HUB_OFFLINE=0 bash "$C/setup.sh"
-  if [ ! -s "$D/hf/done.txt" ]; then
-    HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" fetch --out "$D/hf"
-    date -u +%FT%TZ > "$D/hf/done.txt"
+  if [ ! -s "$DATA/done.txt" ]; then
+    HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" fetch "${FETCH[@]}" --out "$DATA"
+    date -u +%FT%TZ > "$DATA/done.txt"
   fi
-  if [ ! -s "$D/plan/units.json" ]; then
-    "$PY" -u "$C/bt_gemma4.py" plan --data "$D/hf" --tokenizer "$TOK" --out "$D/plan"
+  if [ ! -s "$PLAN/units.json" ]; then
+    "$PY" -u "$C/bt_gemma4.py" plan --data "$DATA" --text "$TEXT" --tokenizer "$TOK" --out "$PLAN"
   fi
-  hash=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['hash'])" "$D/plan/units.json")
+  hash=$("$PY" -c "import json, sys; print(json.load(open(sys.argv[1]))['hash'])" "$PLAN/units.json")
   if gsutil -q stat "$O/full/plan-hash.txt"; then
     there=$(gsutil cat "$O/full/plan-hash.txt")
     [ "$there" = "$hash" ] || { echo "this VM's plan $hash differs from $O/full/plan-hash.txt ($there)"; exit 1; }
@@ -120,7 +128,7 @@ all)
     echo "$hash" | gsutil -q cp - "$O/full/plan-hash.txt"
   fi
   log "plan $hash"
-  if gsutil -q stat "$O/probe/run-here"; then
+  if [ "$step" = all ] && gsutil -q stat "$O/probe/run-here"; then
     if ! gsutil -q stat "$O/probe/report/selection.json"; then
       log "probe"
       pilot=()
@@ -165,11 +173,11 @@ all)
   fi
   prompt=$(gsutil cat "$O/full/prompt.txt")
   log "prompt $prompt"
-  ( HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" publish --plan "$D/plan" --root "$O/full" --data "$D/hf" --repo "$REPO" \
+  ( HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" publish --plan "$PLAN" --root "$O/full" --data "$DATA" --repo "$REPO" \
       --region "$REGION" --owner "$(hostname)/publish" --run "$RUN_ID" --work-dir "$SHM/pub" --interval 300 \
       > ~/logs/bt4_publish.log 2>&1; code=$?; echo "EXIT $code" >> ~/logs/bt4_publish.log; exit $code ) & pub=$!
-  job 0 bt4_full_0 work_loop "$D/plan" "$O/full" "$prompt" & a=$!
-  job 1 bt4_full_1 work_loop "$D/plan" "$O/full" "$prompt" & b=$!
+  job 0 bt4_full_0 work_loop "$PLAN" "$O/full" "$prompt" & a=$!
+  job 1 bt4_full_1 work_loop "$PLAN" "$O/full" "$prompt" & b=$!
   wait $a && ca=0 || ca=$?
   wait $b && cb=0 || cb=$?
   if [ $ca != 0 ] || [ $cb != 0 ]; then
@@ -181,10 +189,8 @@ all)
   gsutil -q cp ~/logs/bt4_publish.log "$O/logs/bt4_publish-$(hostname)-$RUN_ID.log" || true
   [ $cp = 0 ] || { echo "publisher failed: ~/logs/bt4_publish.log"; exit 1; }
   log "final"
-  HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" final --plan "$D/plan" --root "$O/full" --repo "$REPO" \
+  HF_HUB_OFFLINE=0 "$PY" -u "$C/bt_gemma4.py" final --plan "$PLAN" --root "$O/full" --repo "$REPO" \
     --owner "$(hostname)/final" --run "$RUN_ID" --work-dir "$SHM/final"
   log "done"
   ;;
-*)
-  echo "usage: run_bt_gemma4.sh all (with O, DIRECTION, CKPT and REPO set)"; exit 1 ;;
 esac

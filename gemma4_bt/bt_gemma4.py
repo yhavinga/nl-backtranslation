@@ -15,6 +15,9 @@ found Gemma 4 with the prompt natural-v1 near the human length (1.019) but with 
     python bt_gemma4.py card --prompt P --out README.md
     python bt_gemma4.py report --data DIR --out bt-gemma4.md
     python bt_gemma4.py datasets --data DIR --sources DIR --out DIR [--standalone]
+    python bt_gemma4.py fetch --roundtrip --out DIR
+    python bt_gemma4.py plan --data DIR --text en --tokenizer TOK --out DIR [--model gemma4-31b-rt]
+    python bt_gemma4.py roundtrip --data DIR --shards DIR --out DIR
 
 fetch: the five datasets of SOURCES (TranslateGemma 27B's English of each Dutch passage, with its scores and checks)
 at fixed revisions, straight from Hugging Face.
@@ -45,6 +48,14 @@ Step 3, one dataset per source (datasets): from a local copy of the merged datas
 per source the files of the source dataset, each with the same rows in the same order and the new columns. With
 --standalone (the published datasets) without TranslateGemma's columns, and Gemma 4's under the plain names
 (standalone()).
+
+Step 4, the round trip (fetch --roundtrip, plan --text en, work, publish, roundtrip): Gemma 4 translates the English
+`en` of the published -gemma4 datasets (ROUNDTRIP_SOURCES) back into Dutch, with the prompt of step 2 from English
+into Dutch, greedy, in the length classes of RT_MODEL on the tokens of `en`; plan checks that every passage's original
+Dutch fits the decode limit of its class with a margin (DECODE_MARGIN). The units run as in step 2, but publish puts
+each shard as it is into the private dataset of the run. roundtrip then appends to every file of the -gemma4
+datasets nl_back, chrF of nl_back against nl (pairs.back_measures, as chrf of the TranslateGemma datasets) and the
+checks of nl_back (back_columns()), and counts them per source, config and split (roundtrip.json).
 """
 
 import argparse
@@ -84,6 +95,21 @@ PARTS = {
     "dpc": ("dpc", "data"),
     "rechtspraak": ("rechtspraak", "data"),
 }
+# The round trip's input: the published -gemma4 datasets (step 3 with --standalone), same keys, layout and rows
+ROUNDTRIP_SOURCES = {
+    "handelingen": ("yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4", "6684cf1e46fa0f967d897fe99fe3cee14a717f23"),
+    "raad": ("yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4", "1e04772378dd007320e3253d982d25115dab4c84"),
+    "dpc": ("yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4", "8772802c64b1264d67b15cb3f8c4f71b94120e09"),
+    "rechtspraak": ("yhavinga/rechtspraak-nl-backtranslated-en-gemma4", "6a8e1a82d8af0330a5d5b04113a06c1be3d336e2"),
+    "fineweb": ("yhavinga/fineweb-2-nl-backtranslated-en-gemma4", "2d2e36d0dc0543201b09be0b20fbc30d45d5446a"),
+}
+RT_MODEL = "gemma4-31b-rt"
+# The decode limit of a passage's class must hold its original Dutch (Gemma 4 tokens) this many times over
+DECODE_MARGIN = 1.25
+# The prompt's own words in a translation (the instruction translated instead of the text, as once in a pilot)
+INSTRUCTION = re.compile(r"translate the following|vertaal de volgende|idiomatic (?:english|dutch)|"
+                         r"idiomatisch (?:nederlands|engels)|output only the translation|geef alleen de vertaling",
+                         re.IGNORECASE)
 SPLITS = ("train", "validation")
 EXPECTED_PASSAGES = 271_710
 MODEL = "gemma4-31b-bt"
@@ -363,7 +389,7 @@ def fetch(args):
     from huggingface_hub import snapshot_download
 
     out = Path(args.out)
-    for key, (repo, revision) in SOURCES.items():
+    for key, (repo, revision) in (ROUNDTRIP_SOURCES if args.roundtrip else SOURCES).items():
         patterns = ["data/*.parquet"] + (["context_turns/*.parquet"] if key == "handelingen" else [])
         snapshot_download(repo, repo_type="dataset", revision=revision, local_dir=str(out / key),
                           allow_patterns=patterns)
@@ -423,25 +449,36 @@ def make_units(segments_by_key, class_names, shard_size, part_order):
 
 
 def plan(args):
-    """The full run's units: every passage of PARTS (train and validation), by its Gemma 4 tokens in the model's
-    classes; a passage above --max-source (default the largest class) stops the plan"""
-    classes = classes_of(args.model)
+    """The full run's units: every passage of PARTS (train and validation), by the Gemma 4 tokens of its text (--text:
+    nl, translated into English; en, the round trip, translated back into Dutch) in the model's classes; a passage
+    above --max-source (default the largest class) stops the plan. For the round trip (--text en, the -gemma4
+    datasets) every passage's original Dutch (tokens_nl, Gemma 4 tokens) times DECODE_MARGIN must fit the decode
+    limit of its class."""
+    model = args.model or (RT_MODEL if args.text == "en" else MODEL)
+    classes = classes_of(model)
     names = list(classes)
     largest = classes[names[-1]]["max_source"]
     max_source = args.max_source or largest
     if max_source > largest:
-        raise SystemExit(f"--max-source {max_source} is beyond the largest class of {args.model} ({largest})")
+        raise SystemExit(f"--max-source {max_source} is beyond the largest class of {model} ({largest})")
     count = Counter(args.tokenizer)
     out = Path(args.out)
     segments_by_key, total = {}, 0
     for part in PARTS:
         for split in SPLITS:
-            table = read_part(args.data, part, split, ["id", "nl"])
-            ids, texts = table.column("id").to_pylist(), table.column("nl").to_pylist()
+            columns = ["id", args.text] + (["tokens_nl"] if args.text == "en" else [])
+            table = read_part(args.data, part, split, columns)
+            ids, texts = table.column("id").to_pylist(), table.column(args.text).to_pylist()
             tokens = count.many(texts)
             over = [i for i, n in zip(ids, tokens) if n > max_source]
             if over:
                 raise SystemExit(f"{part}/{split}: {len(over)} passages above {max_source} tokens, e.g. {over[:3]}")
+            if args.text == "en":
+                short = [i for i, n, n_nl in zip(ids, tokens, table.column("tokens_nl").to_pylist())
+                         if n_nl * DECODE_MARGIN > classes[class_of(n, classes)]["max_decode"]]
+                if short:
+                    raise SystemExit(f"{part}/{split}: {len(short)} passages whose original Dutch times "
+                                     f"{DECODE_MARGIN} exceeds the decode limit of their class, e.g. {short[:3]}")
             per = collections.defaultdict(list)
             for i, text, n in zip(ids, texts, tokens):
                 per[class_of(n, classes)].append({"id": i, "text": text, "tokens": n})
@@ -453,9 +490,11 @@ def plan(args):
     if args.expect is not None and total != args.expect:
         raise SystemExit(f"{total} passages, expected {args.expect}")
     units = make_units(segments_by_key, names, args.shard_size, list(PARTS))
-    info = {"model": args.model, "classes": classes, "max_source": max_source, "shard_size": args.shard_size,
+    info = {"model": model, "classes": classes, "max_source": max_source, "shard_size": args.shard_size,
             "passages": total, "units": units, "hash": plan_hash(units),
-            "revisions": {k: v[1] for k, v in SOURCES.items()}}
+            "revisions": {k: v[1] for k, v in (ROUNDTRIP_SOURCES if args.text == "en" else SOURCES).items()}}
+    if args.text == "en":  # the languages of a plan; a plan without them is nl->en
+        info.update(source="en", target="nl")
     (out / "units.json").write_text(json.dumps(info, indent=0))
     print(f"UNITS {json.dumps({'units': len(units), 'passages': total, 'hash': info['hash'], 'per_class': dict(collections.Counter(u['class'] for u in units))})}", flush=True)
 
@@ -564,6 +603,11 @@ def load_plan(path):
     return json.loads((Path(path) / "units.json").read_text())
 
 
+def languages(plan_info):
+    """(source, target) of a plan: nl->en unless the plan names them (the round trip: en->nl)"""
+    return plan_info.get("source", "nl"), plan_info.get("target", "en")
+
+
 class Progress:
     """The units done in this region (shards/) and in the other (other-done.txt), read again after `every` seconds"""
 
@@ -644,7 +688,7 @@ class Translator:
 
     def codec(self, prompt):
         if prompt not in self.codecs:
-            self.codecs[prompt] = ge.TurnCodec(self.tokenizer, self.model, prompt, "nl", "en")
+            self.codecs[prompt] = ge.TurnCodec(self.tokenizer, self.model, prompt, *languages(self.plan))
         return self.codecs[prompt]
 
     def segments(self, u):
@@ -736,8 +780,8 @@ def g4_schema():
             ("gemma4_time", pa.string())]
 
 
-def prompt_text(prompt):
-    return ge.user_text(ge.PROMPTS[prompt], "{text}", "nl", "en")
+def prompt_text(prompt, source="nl", target="en"):
+    return ge.user_text(ge.PROMPTS[prompt], "{text}", source, target)
 
 
 def published_rows(unit, shard, source_rows, segments_tokens):
@@ -946,6 +990,16 @@ def unit_file(unit, shard_path, sources, tokens_of, out_path):
     return len(rows)
 
 
+def hf_file(plan_info, unit, shard_path, sources, tokens_of, out_path):
+    """The file of one unit for the run's Hugging Face dataset and its rows: unit_file() of the nl->en run, or for
+    the round trip the shard as it is (roundtrip joins it with the -gemma4 datasets)"""
+    import pyarrow.parquet as pq
+
+    if languages(plan_info) == ("en", "nl"):
+        return str(shard_path), pq.read_metadata(shard_path).num_rows
+    return str(out_path), unit_file(unit, shard_path, sources, tokens_of, out_path)
+
+
 def publish(args):
     """One process a region (a lease on publish.lock): each shard of this region not yet on Hugging Face, as one
     parquet file, in commits of at most --batch files every --interval seconds; ends once the region is complete and
@@ -988,9 +1042,10 @@ def publish(args):
             for name in new[k:k + args.batch]:
                 shard = work_dir / "pub-shards" / f"{name}.parquet"
                 store.get(f"shards/{name}.parquet", shard)
-                out = work_dir / "pub-files" / hf_path(name)
-                rows += unit_file(units[name], shard, sources, tokens_of, out)
-                ops.append(CommitOperationAdd(path_in_repo=hf_path(name), path_or_fileobj=str(out)))
+                out, n = hf_file(plan_info, units[name], shard, sources, tokens_of,
+                                 work_dir / "pub-files" / hf_path(name))
+                rows += n
+                ops.append(CommitOperationAdd(path_in_repo=hf_path(name), path_or_fileobj=out))
             api.create_commit(args.repo, repo_type="dataset", operations=ops,
                               commit_message=f"{len(ops)} shards from {args.region} ({rows} rows)")
             size = sum(Path(op.path_or_fileobj).stat().st_size for op in ops)
@@ -1175,6 +1230,10 @@ def final(args):
     if expected - on_hf:
         print(f"NOT COMPLETE: {len(expected - on_hf)} of {len(expected)} units not yet on Hugging Face", flush=True)
         return
+    if languages(plan_info) == ("en", "nl"):
+        print("FINAL every unit of the round trip is on Hugging Face; roundtrip makes the datasets and their numbers",
+              flush=True)
+        return
     store = GcsStore(args.root)
     if store.exists("report/bt-gemma4.md"):
         print("the report is there", flush=True)
@@ -1271,6 +1330,127 @@ def datasets(args):
     print(f"DATASETS {json.dumps(counts)}", flush=True)
 
 
+# ---------------------------------------------------------------------------------------------------- round trip
+
+def back_columns(nl, en, back, ended):
+    """The round trip's measures of one row: chrF of the back-translation against the original and its decode_loop
+    and structure against en (pairs.back_measures, as in the TranslateGemma datasets), English left in it
+    (publish.english_left, the mirror of dutch_left) and chatter"""
+    import pairs as pm
+    import publish
+
+    m = pm.back_measures(nl, en, back)
+    return {"chrf": m["chrf"], "back_ended": ended, "back_decode_loop": m["back_decode_loop"],
+            "back_english_left": publish.english_left(back, en), "back_structure": m["back_structure"],
+            "back_chatter": chatter(back, en)}
+
+
+def _back_chunk(rows):
+    return [back_columns(*r) for r in rows]
+
+
+def back_schema():
+    import pyarrow as pa
+
+    return [("nl_back", pa.string()), ("back_tokens_out", pa.int32()), ("back_ended", pa.bool_()),
+            ("chrf", pa.float64()), ("back_decode_loop", pa.bool_()), ("back_english_left", pa.bool_()),
+            ("back_structure", pa.list_(pa.string())), ("back_chatter", pa.bool_())]
+
+
+def roundtrip_stats(rows):
+    """The numbers of the round trip over rows (dicts with the dataset's hard_fails, nl, en and the new columns)"""
+    chrf = [r["chrf"] for r in rows]
+    passed = [r["chrf"] for r in rows if not r["hard_fails"]]
+    q = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+    return {"n": len(rows),
+            "chrf": {f"p{round(p * 100)}": quantile(chrf, p) for p in q} | {"mean": round(statistics.fmean(chrf), 3)},
+            "chrf_without_hard_fails": ({f"p{round(p * 100)}": quantile(passed, p) for p in q}
+                                        | {"mean": round(statistics.fmean(passed), 3), "n": len(passed)}),
+            "chrf_below": {str(t): sum(c < t for c in chrf) for t in (30, 40, 50)},
+            "back_not_ended": sum(not r["back_ended"] for r in rows),
+            "back_decode_loop": sum(r["back_decode_loop"] for r in rows),
+            "back_english_left": sum(r["back_english_left"] for r in rows),
+            "back_chatter": sum(r["back_chatter"] for r in rows),
+            "back_structure": sum(bool(r["back_structure"]) for r in rows),
+            "back_structure_categories": dict(collections.Counter(c for r in rows for c in r["back_structure"])),
+            "instruction": sum(bool(INSTRUCTION.search(r["nl_back"])) and not INSTRUCTION.search(r["en"])
+                               for r in rows),
+            "empty": sum(not r["nl_back"].strip() for r in rows),
+            "back_tokens_out_max": max(r["back_tokens_out"] for r in rows)}
+
+
+def roundtrip(args):
+    """Per source of ROUNDTRIP_SOURCES, in --out/<key>/: the files of the -gemma4 dataset (--data, as fetch
+    --roundtrip wrote it), each with the same rows in the same order, every column unchanged, and the round trip's
+    columns appended (back_schema()); every row gets the one translation of the shards (--shards: a local copy of
+    the run's Hugging Face dataset), and every translation is used once. roundtrip.json: roundtrip_stats() per
+    source, config and split, the prompt and its text."""
+    import concurrent.futures
+    import multiprocessing
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    back, prompts = {}, collections.Counter()
+    for path in sorted(Path(args.shards).rglob("*.parquet")):
+        if ".cache" in path.relative_to(args.shards).parts:
+            continue
+        for r in pq.read_table(path, columns=["id", "text_nl", "ended", "tokens_out", "prompt"]).to_pylist():
+            if r["id"] in back:
+                raise SystemExit(f"{r['id']} twice in the shards ({path.name})")
+            back[r["id"]] = r
+            prompts[r["prompt"]] += 1
+    if len(prompts) != 1:
+        raise SystemExit(f"the shards have {len(prompts)} prompts: {dict(prompts)}")
+    out = Path(args.out)
+    stats, counts = {}, {}
+    pool = (concurrent.futures.ProcessPoolExecutor(args.processes, mp_context=multiprocessing.get_context("spawn"))
+            if args.processes > 1 else None)
+    for part, (key, folder) in PARTS.items():
+        for split in SPLITS:
+            measured = []
+            for path in source_files(args.data, key, folder, split):
+                table = pq.read_table(path)
+                rows = table.select(["id", "nl", "en", "hard_fails"]).to_pylist()
+                missing = [r["id"] for r in rows if r["id"] not in back]
+                if missing:
+                    raise SystemExit(f"{key}/{folder}/{path.name}: {len(missing)} rows without a translation, e.g. "
+                                     f"{missing[:3]}")
+                shards = [back.pop(r["id"]) for r in rows]
+                triples = [(r["nl"], r["en"], s["text_nl"], s["ended"]) for r, s in zip(rows, shards)]
+                chunks = [triples[k:k + 2000] for k in range(0, len(triples), 2000)]
+                new = [m for part_rows in (pool.map if pool else map)(_back_chunk, chunks) for m in part_rows]
+                columns = {"nl_back": [s["text_nl"] for s in shards],
+                           "back_tokens_out": [s["tokens_out"] for s in shards]}
+                for name, _ in back_schema()[2:]:
+                    columns[name] = [m[name] for m in new]
+                result = table
+                for name, kind in back_schema():
+                    result = result.append_column(pa.field(name, kind), pa.array(columns[name], type=kind))
+                target = out / key / folder / path.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                pq.write_table(result, target, compression="zstd")
+                written = pq.read_table(target)
+                if not written.select(table.column_names).equals(table) or written.num_rows != table.num_rows:
+                    raise SystemExit(f"{target}: the written file differs from the source in its columns")
+                counts[f"{key}/{folder}/{path.name}"] = written.num_rows
+                measured += [dict(r, nl_back=s["text_nl"], back_tokens_out=s["tokens_out"], **m)
+                             for r, s, m in zip(rows, shards, new)]
+            stats[f"{key}/{folder}/{split}"] = roundtrip_stats(measured)
+            print(f"ROUNDTRIP {key}/{folder}/{split} {json.dumps(stats[f'{key}/{folder}/{split}']['chrf'])}",
+                  flush=True)
+    if pool:
+        pool.shutdown()
+    if back:
+        raise SystemExit(f"{len(back)} translations of the shards belong to no row, e.g. {sorted(back)[:3]}")
+    prompt = next(iter(prompts))
+    result = {"created": utc(), "files": counts, "rows": sum(counts.values()), "prompt": prompt,
+              "prompt_text": prompt_text(prompt, "en", "nl"), "stats": stats,
+              "revisions": {k: v[1] for k, v in ROUNDTRIP_SOURCES.items()}}
+    (out / "roundtrip.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
+    print(f"ROUNDTRIP OK {result['rows']} rows in {len(counts)} files", flush=True)
+
+
 # ---------------------------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1278,6 +1458,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("fetch")
     p.add_argument("--out", required=True)
+    p.add_argument("--roundtrip", action="store_true", help="The -gemma4 datasets (ROUNDTRIP_SOURCES) instead")
     p = sub.add_parser("probeplan")
     p.add_argument("--data", required=True)
     p.add_argument("--pilot", default=None,
@@ -1288,8 +1469,10 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p = sub.add_parser("plan")
     p.add_argument("--data", required=True)
+    p.add_argument("--text", choices=("nl", "en"), default="nl",
+                   help="The column to translate: nl into English, or en back into Dutch (the round trip)")
     p.add_argument("--tokenizer", required=True)
-    p.add_argument("--model", default=MODEL)
+    p.add_argument("--model", default=None, help=f"Default {MODEL}, with --text en {RT_MODEL}")
     p.add_argument("--max-source", type=int, default=None,
                    help="The largest passage in Gemma 4 tokens (default: the model's largest class)")
     p.add_argument("--shard-size", type=int, default=SHARD_SIZE)
@@ -1348,11 +1531,17 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--standalone", action="store_true",
                    help="Without TranslateGemma's columns, Gemma 4's under the plain names (standalone())")
+    p = sub.add_parser("roundtrip")
+    p.add_argument("--data", required=True, help="The -gemma4 datasets as fetch --roundtrip wrote them")
+    p.add_argument("--shards", required=True, help="A local copy of the round trip's Hugging Face dataset")
+    p.add_argument("--out", required=True)
+    p.add_argument("--processes", type=int, default=1)
     args = parser.parse_args(argv)
     if getattr(args, "expect", None) == 0:
         args.expect = None
     {"fetch": fetch, "probeplan": probeplan, "plan": plan, "work": work, "status": status, "select": select,
-     "publish": publish, "final": final, "card": card, "report": report, "datasets": datasets}[args.command](args)
+     "publish": publish, "final": final, "card": card, "report": report, "datasets": datasets,
+     "roundtrip": roundtrip}[args.command](args)
 
 
 if __name__ == "__main__":

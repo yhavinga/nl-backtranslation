@@ -13,6 +13,7 @@
 #   STATE      a directory for the keeper's state (default ~/logs/bt4_keeper_state)
 #   REPORTS    a directory for copies of the selection and the final report (default $STATE/report)
 #   POLL       seconds between cycles (default 60); RETRIES  restarts of a failed run per VM (default 2)
+#   STEP       the step of run_bt_gemma4.sh each VM runs: all (default) or roundtrip
 # TPU_UP and TPU_DOWN are where a quota guard belongs: the keeper never creates or deletes a VM in another way.
 # The HF token goes from ~/.cache/huggingface/token here to each VM through stdin; it is never an argument.
 # Each cycle:
@@ -20,7 +21,7 @@
 #       region complete and the VM's run ended or the VM not READY  TPU_DOWN
 #       no request                     TPU_UP
 #       VM preempted/stopped/failed    TPU_UP --replace
-#       VM READY, no run log           HF token through stdin, scripts from the region's bucket, run_bt_gemma4.sh all
+#       VM READY, no run log           HF token through stdin, scripts from the region's bucket, run_bt_gemma4.sh STEP
 #                                      detached
 #       run log without EXIT, no run   (rebooted VM) the log moved aside, the next cycle starts again
 #       run log ends EXIT 0            TPU_DOWN (its region is complete)
@@ -41,6 +42,8 @@ STATE=${STATE:-$HOME/logs/bt4_keeper_state}
 REPORTS=${REPORTS:-$STATE/report}
 POLL=${POLL:-60}
 RETRIES=${RETRIES:-2}
+STEP=${STEP:-all}
+case $STEP in all|roundtrip) ;; *) echo "STEP is all or roundtrip, not '$STEP'"; exit 1 ;; esac
 SHM=/dev/shm/bt_gemma4
 mkdir -p "$STATE" "$REPORTS"
 log() { echo "$(date -u +%FT%TZ) $*"; }
@@ -156,7 +159,7 @@ while true; do
           o=${DIR[$region]}
           log "$name: new run"
           ssh_vm "$name" "$zone" 'mkdir -p ~/.cache/huggingface && umask 077 && cat > ~/.cache/huggingface/token' < ~/.cache/huggingface/token > /dev/null 2>&1 \
-            && ssh_vm "$name" "$zone" "mkdir -p $SHM/code ~/logs && gsutil -m -q cp '$o/scripts/*' $SHM/code/ && (setsid nohup bash -c 'echo \$\$ > ~/logs/bt4_run.pid; O=$o DIRECTION=${DIRECTION[$region]} CKPT=${CKPT[$region]} REPO=$REPO bash $SHM/code/run_bt_gemma4.sh all > ~/logs/bt4_run.log 2>&1; echo EXIT \$? >> ~/logs/bt4_run.log' > /dev/null 2>&1 < /dev/null &) && echo started" < /dev/null 2>&1 | tail -n 1
+            && ssh_vm "$name" "$zone" "mkdir -p $SHM/code ~/logs && gsutil -m -q cp '$o/scripts/*' $SHM/code/ && (setsid nohup bash -c 'echo \$\$ > ~/logs/bt4_run.pid; O=$o DIRECTION=${DIRECTION[$region]} CKPT=${CKPT[$region]} REPO=$REPO bash $SHM/code/run_bt_gemma4.sh $STEP > ~/logs/bt4_run.log 2>&1; echo EXIT \$? >> ~/logs/bt4_run.log' > /dev/null 2>&1 < /dev/null &) && echo started" < /dev/null 2>&1 | tail -n 1
         elif grep -q '^RUNLOG' <<< "$out"; then
           tail_line=$(echo "$out" | grep -v '^RUNLOG' | tail -n 1)
           [ "$tail_line" != "$(cat "$STATE/$name.tail" 2> /dev/null)" ] && log "$name run: $tail_line"

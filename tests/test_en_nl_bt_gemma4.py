@@ -504,3 +504,148 @@ def test_the_probes_prompts_fit_every_class_of_the_bt_model():
         codec = ge.TurnCodec(tok, ge.MODELS[bg.MODEL], name, "nl", "en")
         codec.check(["Dit is een zin."])
         assert len(codec.encode("x")) - 1 <= headroom
+
+
+# ---------------------------------------------------------------------------------------------------- round trip
+
+def fake_gemma4_datasets(root, n_per=3, tokens_nl=5):
+    """The -gemma4 datasets as fetch --roundtrip writes them: the published columns that the round trip reads"""
+    for part, (key, folder) in bg.PARTS.items():
+        for split in bg.SPLITS:
+            rows = [{"id": f"{part}:{split}:{i}", "nl": "Dit is tekst nummer een.", "en": " ".join(["word"] * (i + 1)),
+                     "tokens_nl": tokens_nl, "hard_fails": ["structure"] if i == 0 else []} for i in range(n_per)]
+            write_source(root, key, folder, split, rows)
+
+
+def test_plan_of_the_round_trip_takes_the_english_and_checks_the_decode_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(bg, "Counter", WordCounter)
+    fake_gemma4_datasets(tmp_path / "hf")
+    n = len(bg.PARTS) * 2 * 3
+    bg.main(["plan", "--data", str(tmp_path / "hf"), "--text", "en", "--tokenizer", "-", "--out",
+             str(tmp_path / "plan"), "--expect", str(n)])
+    info = bg.load_plan(tmp_path / "plan")
+    assert info["model"] == bg.RT_MODEL and bg.languages(info) == ("en", "nl")
+    assert info["revisions"] == {k: v[1] for k, v in bg.ROUNDTRIP_SOURCES.items()}
+    texts = [r["text"] for u in info["units"] for r in bg.read_rows(tmp_path / "plan" / u["segments"])[u["start"]:u["end"]]]
+    assert sorted(texts) == sorted(["word", "word word", "word word word"] * (n // 3))
+    # 96 decode tokens in tiny hold 76 tokens of Dutch with the margin of 1.25, not 77
+    fake_gemma4_datasets(tmp_path / "hf2", tokens_nl=77)
+    with pytest.raises(SystemExit, match="exceeds the decode limit"):
+        bg.main(["plan", "--data", str(tmp_path / "hf2"), "--text", "en", "--tokenizer", "-", "--out",
+                 str(tmp_path / "p2"), "--expect", "0"])
+    # nl -> en as before: the plan names no languages and has the model of the back-translation
+    fake_hf(tmp_path / "hf3")
+    bg.main(["plan", "--data", str(tmp_path / "hf3"), "--tokenizer", "-", "--out", str(tmp_path / "p3"), "--expect", "0"])
+    old = bg.load_plan(tmp_path / "p3")
+    assert old["model"] == bg.MODEL and "source" not in old and bg.languages(old) == ("nl", "en")
+
+
+def test_the_round_trip_asks_for_dutch_from_the_english():
+    plan_info = {"model": bg.RT_MODEL, "classes": ge.MODELS[bg.RT_MODEL]["length_classes"], "source": "en",
+                 "target": "nl"}
+    args = type("Args", (), {"length_class": "small"})()
+    codec = bg.Translator(args, plan_info).codec("natural-v1-fmt")
+    assert codec.target == "nl"
+    assert codec.text("Hello.").startswith("<bos><|turn>user\nTranslate the following English text into natural, "
+                                           "idiomatic Dutch, as a native speaker would write it")
+    assert bg.prompt_text("natural-v1-fmt", "en", "nl").startswith("Translate the following English text into")
+
+
+def test_the_round_trip_publishes_a_shard_as_it_is(tmp_path):
+    shard = tmp_path / "s.parquet"
+    bg.write_parquet([{"id": "a", "text_nl": "Hallo.", "ended": True}, {"id": "b", "text_nl": "Ja.", "ended": True}],
+                     shard)
+    path, rows = bg.hf_file({"source": "en", "target": "nl"}, {"name": "dpc/train-tiny-0000"}, shard, None, None,
+                            tmp_path / "out.parquet")
+    assert (path, rows) == (str(shard), 2) and not (tmp_path / "out.parquet").exists()
+
+
+def rt_shards(root, data, skip=(), extra=()):
+    """The round trip's shards for every row of fake_gemma4_datasets: the Dutch is the original but for i == 2"""
+    for part, (key, folder) in bg.PARTS.items():
+        for split in bg.SPLITS:
+            rows = bg.read_rows(next((Path(data) / key / folder).glob(f"{split}-*.parquet")))
+            out = [{"id": r["id"], "text_nl": r["nl"] if not r["id"].endswith(":2") else "Iets heel anders.",
+                    "ended": not r["id"].endswith(":1"), "tokens_out": 7, "tokens_in": 9, "prompt": "natural-v1-fmt"}
+                   for r in rows if r["id"] not in skip]
+            out += [dict(out[0], id=i) for i in extra if i.startswith(f"{part}:{split}:")]
+            bg.write_parquet(out, Path(root) / part / f"{split}-tiny-0000.parquet")
+
+
+def test_roundtrip_appends_the_columns_to_every_file_and_keeps_the_rest(tmp_path):
+    import pyarrow.parquet as pq
+    import sacrebleu
+
+    fake_gemma4_datasets(tmp_path / "hf")
+    rt_shards(tmp_path / "shards", tmp_path / "hf")
+    bg.main(["roundtrip", "--data", str(tmp_path / "hf"), "--shards", str(tmp_path / "shards"), "--out",
+             str(tmp_path / "out")])
+    source = pq.read_table(tmp_path / "hf" / "handelingen" / "context_turns" / "train-00000-of-00001.parquet")
+    table = pq.read_table(tmp_path / "out" / "handelingen" / "context_turns" / "train-00000-of-00001.parquet")
+    assert table.column_names == source.column_names + [n for n, _ in bg.back_schema()]
+    assert table.select(source.column_names).equals(source)
+    rows = table.to_pylist()
+    assert rows[0]["chrf"] == 100.0 and rows[0]["nl_back"] == rows[0]["nl"] and rows[0]["back_tokens_out"] == 7
+    assert rows[1]["back_ended"] is False and rows[0]["back_ended"] is True
+    assert rows[2]["chrf"] == round(sacrebleu.sentence_chrf("Iets heel anders.", ["Dit is tekst nummer een."]).score, 3)
+    assert rows[2]["back_structure"] == [] and rows[2]["back_chatter"] is False
+    result = json.loads((tmp_path / "out" / "roundtrip.json").read_text())
+    assert result["rows"] == len(bg.PARTS) * 2 * 3 and result["prompt"] == "natural-v1-fmt"
+    s = result["stats"]["handelingen/context_turns/train"]
+    assert s["n"] == 3 and s["back_not_ended"] == 1 and s["chrf_without_hard_fails"]["n"] == 2
+    assert s["chrf"]["p95"] == 100.0 and s["chrf_below"]["50"] == 1
+
+
+def test_roundtrip_refuses_a_row_without_a_translation_and_a_translation_of_no_row(tmp_path):
+    fake_gemma4_datasets(tmp_path / "hf")
+    rt_shards(tmp_path / "s1", tmp_path / "hf", skip={"raad:validation:1"})
+    with pytest.raises(SystemExit, match="1 rows without a translation"):
+        bg.main(["roundtrip", "--data", str(tmp_path / "hf"), "--shards", str(tmp_path / "s1"), "--out",
+                 str(tmp_path / "o1")])
+    rt_shards(tmp_path / "s2", tmp_path / "hf", extra={"dpc:train:9"})
+    with pytest.raises(SystemExit, match="1 translations of the shards belong to no row"):
+        bg.main(["roundtrip", "--data", str(tmp_path / "hf"), "--shards", str(tmp_path / "s2"), "--out",
+                 str(tmp_path / "o2")])
+    rt_shards(tmp_path / "s3", tmp_path / "hf", extra={"dpc:train:0"})
+    with pytest.raises(SystemExit, match="twice in the shards"):
+        bg.main(["roundtrip", "--data", str(tmp_path / "hf"), "--shards", str(tmp_path / "s3"), "--out",
+                 str(tmp_path / "o3")])
+
+
+def test_back_columns_find_english_left_chatter_and_a_loop():
+    en = "The council will decide on the new plan next week, after the consultation with all of the residents."
+    left = bg.back_columns("De raad beslist.", en, "De raad will decide on the new plan next week, after the "
+                           "consultation with all of the residents.", True)
+    assert left["back_english_left"] is True
+    chat = bg.back_columns("De raad beslist.", "The council decides.", "Hier is de vertaling: De raad beslist.", True)
+    assert chat["back_chatter"] is True and chat["back_english_left"] is False
+    loop = bg.back_columns("Wij gaan.", "We go.", "Wij gaan, gaan, gaan, gaan, gaan, gaan, gaan, gaan.", False)
+    assert loop["back_decode_loop"] is True and loop["back_ended"] is False
+
+
+def test_every_class_of_the_round_trip_leaves_room_for_the_prompt_and_the_dutch():
+    model = ge.MODELS[bg.RT_MODEL]
+    classes = model["length_classes"]
+    assert list(classes) == list(model["slots"]) and model["prompt"] == "natural-v1-fmt"
+    assert {k: model[k] for k in ("maxtext_model", "revision", "chips", "eos_ids", "turn")} == \
+        {k: ge.MODELS[bg.MODEL][k] for k in ("maxtext_model", "revision", "chips", "eos_ids", "turn")}
+    # the most Gemma 4 tokens of an original Dutch passage per class of its English (the -gemma4 datasets)
+    most_dutch = {"tiny": 72, "small": 227, "medium": 425, "long": 511, "xlong": 511}
+    for name, c in classes.items():
+        assert c["prefill_lengths"] == sorted(c["prefill_lengths"])
+        assert c["prefill_lengths"][-1] - c["max_source"] >= 160
+        assert c["max_decode"] >= most_dutch[name] * bg.DECODE_MARGIN
+        assert model["slots"][name] % model["chips"] == 0
+        assert model["slots"][name] * (c["prefill_lengths"][-1] + c["max_decode"]) <= 46_080
+
+
+@pytest.mark.skipif(not (GEMMA4_TOKENIZER / "tokenizer.json").exists(), reason="Gemma 4's tokenizer is not here")
+def test_the_round_trips_prompt_fits_every_class():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(str(GEMMA4_TOKENIZER))
+    classes = ge.MODELS[bg.RT_MODEL]["length_classes"]
+    headroom = min(c["prefill_lengths"][-1] - c["max_source"] for c in classes.values())
+    codec = ge.TurnCodec(tok, ge.MODELS[bg.RT_MODEL], ge.MODELS[bg.RT_MODEL]["prompt"], "en", "nl")
+    codec.check(["This is a sentence."])
+    assert len(codec.encode("x")) - 1 <= headroom

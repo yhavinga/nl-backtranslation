@@ -17,7 +17,8 @@ prompts:
   # and paragraph breaks, italics, lists), and its English was still somewhat longer than a human translation (median
   # 1.019 Dutch words per English word, human ~1.06). natural-v1-fmt is natural-v1 with one sentence
   # against added formatting; natural-v1-fmt-len adds one sentence on length. In Gemma 4's turn they take 114 and 135
-  # tokens beside the source, which the classes of gemma4-31b-bt leave room for (160-192).
+  # tokens beside the source, which the classes of gemma4-31b-bt leave room for (160-192). The round trip
+  # (gemma4-31b-rt) uses natural-v1-fmt from English into Dutch.
   natural-v1:
     plain: |-
       Translate the following {source} text into natural, idiomatic {target}, as a native speaker would write it, not word for word. Translate everything: leave nothing out and add nothing; keep every name, number, detail and nuance, and the tone. Be as concise as the original. Keep the paragraphs, line breaks and formatting. Output only the translation, without explanation or commentary.
@@ -65,3 +66,25 @@ models:
       long: {max_source: 384, prefill_lengths: [448, 576], max_decode: 640}
       xlong: {max_source: 512, prefill_lengths: [576, 704], max_decode: 832}
     slots: {tiny: 160, small: 80, medium: 52, long: 36, xlong: 28}
+  # The round trip (bt_gemma4.py plan --text en): Gemma 4's English of the -gemma4 datasets back into Dutch, with the
+  # same checkpoint, turn, stop tokens and prompt (its {source} English, its {target} Dutch). The classes count the
+  # Gemma 4 tokens of the English (at most 482 there). The original Dutch of a passage has more tokens than its English
+  # (median 1.29 times, up to 3.0 in the shortest), and a back-translation is about as long as the original, so
+  # max_decode is at least 1.25 times the most tokens of an original Dutch passage in its class (tiny 72, small 227,
+  # medium 425, long and xlong 511); plan --text en checks that for every passage (DECODE_MARGIN). The slots keep
+  # ~43-46k slot-tokens, as above, and a whole number of them per chip.
+  gemma4-31b-rt:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-fmt
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    length_classes:
+      tiny: {max_source: 32, prefill_lengths: [192], max_decode: 96}
+      small: {max_source: 128, prefill_lengths: [192, 320], max_decode: 320}
+      medium: {max_source: 256, prefill_lengths: [320, 448], max_decode: 576}
+      long: {max_source: 384, prefill_lengths: [448, 576], max_decode: 704}
+      xlong: {max_source: 512, prefill_lengths: [576, 704], max_decode: 704}
+    slots: {tiny: 160, small: 68, medium: 44, long: 36, xlong: 32}

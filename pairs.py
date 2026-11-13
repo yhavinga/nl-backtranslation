@@ -196,10 +196,19 @@ def back_segments(args):
     print(f"BACK {len(rows)} segments, skipped {({k: len(v) for k, v in skipped.items()})}")
 
 
-def measure(nl, en, back):
-    """The measures of one triple; back is None when the English was not back-translated"""
+def back_measures(nl, en, back):
+    """The measures of a back-translation back (Dutch) of en against the original nl: chrF (sacrebleu's sentence chrF
+    with its defaults, chrF2: character n-grams up to 6, no word n-grams, beta 2; rounded to 3 decimals), and the
+    back-translation's decode_loop and structure against en. gemma4_bt's round trip uses the same."""
     import sacrebleu
 
+    return {"chrf": round(sacrebleu.sentence_chrf(back, [nl]).score, 3),
+            "back_decode_loop": bool(back) and publish.decode_loop(back, en),
+            "back_structure": structure.differences(en, back)}
+
+
+def measure(nl, en, back):
+    """The measures of one triple; back is None when the English was not back-translated"""
     sentences_nl, sentences_en = sentences(nl, sp.ABBREVIATIONS), sentences(en, ENGLISH_ABBREVIATIONS)
     missing = missing_numbers(nl, en)
     row = {
@@ -212,9 +221,7 @@ def measure(nl, en, back):
         "chrf": None, "back_decode_loop": None, "back_structure": None,
     }
     if back is not None:
-        row["chrf"] = round(sacrebleu.sentence_chrf(back, [nl]).score, 3)
-        row["back_decode_loop"] = bool(back) and publish.decode_loop(back, en)
-        row["back_structure"] = structure.differences(en, back)
+        row.update(back_measures(nl, en, back))
     return row
 
 
