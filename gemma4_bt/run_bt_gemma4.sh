@@ -21,6 +21,12 @@
 # translate en back into Dutch, the publisher puts the shards into REPO as they are, and final makes no report
 # A preempted VM loses at most a unit a half. The v6e-8 runs as two TPUs of 4 chips (Gemma 4 31B allows at most 4-way
 # tensor parallelism). Needs ~/.cache/huggingface/token (keeper.sh puts it there through stdin).
+# Optional:
+#   ONE_PROCESS=1  the host's 4 chips as one process (a worker of a v4-32, each worker its own TPU of 4 chips): one
+#                  job (half 0) instead of two; started on every worker of the slice, each takes units on its own
+#   CLAIMS=gs://<bucket>/<dir>/full  the claims under that directory instead of $O/full (bt_gemma4.py work
+#                  --claims-root): the full/ directory of another region whose VMs take the same units, so that no
+#                  unit is started in both
 set -euo pipefail
 O=${O:?set O to the gs:// directory of this region}
 DIRECTION=${DIRECTION:?forward or backward}
@@ -42,8 +48,15 @@ export XLA_FLAGS=--xla_dump_hlo_as_text=false TOKENIZERS_PARALLELISM=false HF_HU
 mkdir -p ~/logs "$D"
 log() { echo "== $* $(date -u +%T)"; }
 
-half() {  # the 4 chips behind the first (0) or second (1) PCI root as a TPU of their own
+half() {  # the 4 chips behind the first (0) or second (1) PCI root as a TPU of their own; ONE_PROCESS: all 4 of the host
   local chips port
+  if [ "${ONE_PROCESS:-0}" = 1 ]; then
+    [ "$1" = 0 ] || { echo "half $1: ONE_PROCESS has only half 0"; exit 2; }
+    echo "one process: TPU_VISIBLE_CHIPS=0,1,2,3"
+    export H=0 TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
+    export TPU_PROCESS_ADDRESSES=localhost:8476 CLOUD_TPU_TASK_ID=0 ALLOW_MULTIPLE_LIBTPU_LOAD=1
+    return 0
+  fi
   chips=$(for g in /dev/vfio/[0-9]*; do n=${g##*/}; dev=$(ls "/sys/kernel/iommu_groups/$n/devices"); echo "${dev%:*} $n"; done \
     | LC_ALL=C sort -k1,1 -k2,2n | awk -v h="$1" '$1 != root {k++; root = $1} k == h + 1 {printf "%s%s", sep, $2; sep = ","}')
   [ "$(echo "$chips" | tr , '\n' | grep -c .)" = 4 ] || { echo "half $1: vfio groups '$chips', not 4 behind one PCI root"; exit 2; }
@@ -85,7 +98,7 @@ work_loop() {  # plan root prompt: this half takes units of each class until non
     for class in $(classes "$plan"); do
       "$PY" -u "$C/bt_gemma4.py" work --plan "$plan" --root "$root" --length-class "$class" ${prompt:+--prompt "$prompt"} \
         --direction "$DIRECTION" --owner "$(hostname)/h$H" --run "$RUN_ID" --region "$REGION" --tokenizer "$TOK" \
-        --ckpt "$CKPT" --work-dir "$SHM/work-h$H"
+        --ckpt "$CKPT" --work-dir "$SHM/work-h$H" ${CLAIMS:+--claims-root "$CLAIMS"}
     done
     st=$("$PY" -u "$C/bt_gemma4.py" status --plan "$plan" --root "$root")
     echo "$st"
@@ -139,9 +152,9 @@ all|roundtrip)
       [ -s "$D/probe/units.json" ] || "$PY" -u "$C/bt_gemma4.py" probeplan --data "$D/hf" "${pilot[@]}" \
         --tokenizer "$TOK" --out "$D/probe"
       job 0 bt4_probe_0 work_loop "$D/probe" "$O/probe" "" & a=$!
-      job 1 bt4_probe_1 work_loop "$D/probe" "$O/probe" "" & b=$!
+      if [ "${ONE_PROCESS:-0}" = 1 ]; then b=; else job 1 bt4_probe_1 work_loop "$D/probe" "$O/probe" "" & b=$!; fi
       wait $a && ca=0 || ca=$?
-      wait $b && cb=0 || cb=$?
+      if [ -n "$b" ]; then wait $b && cb=0 || cb=$?; else cb=0; fi
       if [ $ca != 0 ] || [ $cb != 0 ]; then echo "probe failed: half 0 $ca, half 1 $cb"; exit 1; fi
     fi
     # The selection and MetricX once, on the VM that creates the lock first (a generation precondition, atomic)
@@ -177,9 +190,9 @@ all|roundtrip)
       --region "$REGION" --owner "$(hostname)/publish" --run "$RUN_ID" --work-dir "$SHM/pub" --interval 300 \
       > ~/logs/bt4_publish.log 2>&1; code=$?; echo "EXIT $code" >> ~/logs/bt4_publish.log; exit $code ) & pub=$!
   job 0 bt4_full_0 work_loop "$PLAN" "$O/full" "$prompt" & a=$!
-  job 1 bt4_full_1 work_loop "$PLAN" "$O/full" "$prompt" & b=$!
+  if [ "${ONE_PROCESS:-0}" = 1 ]; then b=; else job 1 bt4_full_1 work_loop "$PLAN" "$O/full" "$prompt" & b=$!; fi
   wait $a && ca=0 || ca=$?
-  wait $b && cb=0 || cb=$?
+  if [ -n "$b" ]; then wait $b && cb=0 || cb=$?; else cb=0; fi
   if [ $ca != 0 ] || [ $cb != 0 ]; then
     kill $pub 2> /dev/null || true
     echo "full run failed: half 0 $ca, half 1 $cb"; exit 1

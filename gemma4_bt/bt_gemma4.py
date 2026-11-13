@@ -40,7 +40,9 @@ v6e-8) takes units of one class at a time: it claims a unit in its region's buck
 a claim older than the lease, or of an earlier run on the same VM, may be taken over), translates it and stores the
 shard there. One region goes through the units forwards, the other backwards; other-done.txt in each region's bucket
 (written by keeper.sh, which lists all buckets) names the units another region has done, so that no VM reads another
-region's bucket. publish (one process a region, under a lease) puts each shard, with the source dataset's columns, the
+region's bucket. Where two regions should not even start the same unit (an on-demand TPU joining a run of spot VMs),
+work --claims-root makes one region claim in the other's claims directory; its shards stay in its own bucket.
+publish (one process a region, under a lease) puts each shard, with the source dataset's columns, the
 new English and its checks, as one parquet file into a private dataset on Hugging Face: the dataset is the merge.
 Nothing is filtered out. final makes the report (report) once every unit is there.
 
@@ -97,11 +99,11 @@ PARTS = {
 }
 # The round trip's input: the published -gemma4 datasets (step 3 with --standalone), same keys, layout and rows
 ROUNDTRIP_SOURCES = {
-    "handelingen": ("yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4", "6684cf1e46fa0f967d897fe99fe3cee14a717f23"),
-    "raad": ("yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4", "1e04772378dd007320e3253d982d25115dab4c84"),
-    "dpc": ("yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4", "8772802c64b1264d67b15cb3f8c4f71b94120e09"),
-    "rechtspraak": ("yhavinga/rechtspraak-nl-backtranslated-en-gemma4", "6a8e1a82d8af0330a5d5b04113a06c1be3d336e2"),
-    "fineweb": ("yhavinga/fineweb-2-nl-backtranslated-en-gemma4", "2d2e36d0dc0543201b09be0b20fbc30d45d5446a"),
+    "handelingen": ("yhavinga/handelingen-tweede-kamer-nl-en-gemma4", "6684cf1e46fa0f967d897fe99fe3cee14a717f23"),
+    "raad": ("yhavinga/openraadsinformatie-nl-en-gemma4", "1e04772378dd007320e3253d982d25115dab4c84"),
+    "dpc": ("yhavinga/rijksoverheid-websites-nl-en-gemma4", "8772802c64b1264d67b15cb3f8c4f71b94120e09"),
+    "rechtspraak": ("yhavinga/rechtspraak-nl-en-gemma4", "6a8e1a82d8af0330a5d5b04113a06c1be3d336e2"),
+    "fineweb": ("yhavinga/fineweb-2-nl-en-gemma4", "2d2e36d0dc0543201b09be0b20fbc30d45d5446a"),
 }
 RT_MODEL = "gemma4-31b-rt"
 # The decode limit of a passage's class must hold its original Dutch (Gemma 4 tokens) this many times over
@@ -631,18 +633,21 @@ def ordered(units, direction):
     return list(units) if direction == "forward" else list(reversed(units))
 
 
-def work_units(units, store, me, translate, lease=LEASE_SECONDS, progress=None, log=print):
+def work_units(units, store, me, translate, lease=LEASE_SECONDS, progress=None, log=print, claims=None):
     """For each unit in order not done here or there: claim it, translate it (translate(unit) -> (rows, seconds),
-    rows a dict of columns) and store its shard. Returns the names done."""
+    rows a dict of columns) and store its shard. Returns the names done. claims: the store of the claims (default
+    store), when the processes of two regions share one claims directory so that neither starts a unit the other has
+    started; shards and other-done.txt stay in store."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     progress = progress or Progress(store)
+    claims = store if claims is None else claims
     done = []
     for u in units:
         if progress.finished(u["name"]):
             continue
-        if not claim(store, f"claims/{u['name']}", me, lease):
+        if not claim(claims, f"claims/{u['name']}", me, lease):
             continue
         if store.exists(f"shards/{u['name']}.parquet"):  # finished by another process since the last listing
             continue
@@ -723,10 +728,11 @@ def work(args):
     if not args.prompt and any(u["prompt"] is None for u in units):
         raise SystemExit("--prompt is needed for the units of the full plan")
     store = GcsStore(args.root)
+    claims = GcsStore(args.claims_root) if args.claims_root else store
     me = {"owner": args.owner, "run": args.run, "region": args.region, "work_dir": args.work_dir}
     translator = Translator(args, plan_info)
     started = now()
-    done = work_units(units, store, me, translator, args.lease, log=lambda s: print(s, flush=True))
+    done = work_units(units, store, me, translator, args.lease, log=lambda s: print(s, flush=True), claims=claims)
     print(f"CLASS {json.dumps({'class': args.length_class, 'units': len(units), 'done_here': len(done), 'engine': translator.device is not None, 'seconds': round(now() - started)})}", flush=True)
 
 
@@ -1481,6 +1487,10 @@ def main(argv=None):
     p = sub.add_parser("work")
     p.add_argument("--plan", required=True)
     p.add_argument("--root", required=True, help="gs:// directory of this region: shards/, claims/, other-done.txt")
+    p.add_argument("--claims-root", default=None,
+                   help="gs:// directory whose claims/ holds the claims instead of --root's: the full/ directory of "
+                        "another region whose VMs take the same units, so that a unit started there is not started "
+                        "here (shards and other-done.txt stay under --root)")
     p.add_argument("--length-class", required=True)
     p.add_argument("--prompt", default=None, help="The prompt of the units without one (the full plan)")
     p.add_argument("--direction", choices=("forward", "backward"), default="forward")

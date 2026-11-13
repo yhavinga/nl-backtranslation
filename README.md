@@ -42,11 +42,11 @@ that of its source; Gemma 4 is under the Apache License 2.0.
 
 | dataset |
 |---|
-| [yhavinga/fineweb-2-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/fineweb-2-nl-backtranslated-en-gemma4) |
-| [yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4) |
-| [yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4) |
-| [yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4) |
-| [yhavinga/rechtspraak-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/rechtspraak-nl-backtranslated-en-gemma4) |
+| [yhavinga/fineweb-2-nl-en-gemma4](https://huggingface.co/datasets/yhavinga/fineweb-2-nl-en-gemma4) |
+| [yhavinga/handelingen-tweede-kamer-nl-en-gemma4](https://huggingface.co/datasets/yhavinga/handelingen-tweede-kamer-nl-en-gemma4) |
+| [yhavinga/openraadsinformatie-nl-en-gemma4](https://huggingface.co/datasets/yhavinga/openraadsinformatie-nl-en-gemma4) |
+| [yhavinga/rijksoverheid-websites-nl-en-gemma4](https://huggingface.co/datasets/yhavinga/rijksoverheid-websites-nl-en-gemma4) |
+| [yhavinga/rechtspraak-nl-en-gemma4](https://huggingface.co/datasets/yhavinga/rechtspraak-nl-en-gemma4) |
 
 ## Sources and models
 
@@ -90,7 +90,7 @@ NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/
 | `setup.sh`, `gemma_judge/setup.sh` | the environments on the TPU hosts, the word list and the idiom source, and Gemma 4 31B-it as a MaxText checkpoint |
 | `gemma4_bt/bt_gemma4.py` | the Gemma 4 back-translation: the source datasets (`fetch`), the probe and the rule that chooses the prompt (`probeplan`, `select`), the units of the full run (`plan`), claiming and translating them (`work`, `status`), the merged dataset on Hugging Face (`publish`, `final`, `report`, `card`), one dataset per source (`datasets`), and the round trip of its English back into Dutch (`fetch --roundtrip`, `plan --text en`, `roundtrip`) |
 | `gemma4_bt/gemma4_engine.py`, `gemma4_bt/models.yml` | Gemma 4 31B-it in MaxText on 4 chips (greedy, continuous batching); the prompts, the length classes and the decode slots of both directions |
-| `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips (`all`, or `roundtrip`); its environment in `/dev/shm/bt_gemma4` |
+| `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips (`all`, or `roundtrip`), or with `ONE_PROCESS=1` on each worker of a v4-32 as one process of its 4 chips (`CLAIMS`: claims in another region's directory, `work --claims-root`); its environment in `/dev/shm/bt_gemma4` |
 | `gemma4_bt/keeper.sh`, `gemma4_bt/stage.sh` | on a control machine: the spot VMs of every region requested, started, restarted and deleted, and the units of the other regions announced; the code put into each region's bucket |
 | `tests/` | tests on made-up data; no network, model or TPU |
 

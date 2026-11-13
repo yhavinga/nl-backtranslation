@@ -135,6 +135,32 @@ def test_units_done_in_the_other_region_are_skipped_and_count_for_the_status(tmp
     assert bg.region_status(plan_info, bg.Progress(store))["complete"]
 
 
+def test_a_unit_claimed_in_the_shared_claims_store_is_skipped_and_a_free_one_claimed_there(tmp_path):
+    store, claims = bg.MemoryStore(), bg.MemoryStore()
+    names = [f"rechtspraak/train-xlong-{k:04d}" for k in range(3)]
+    # a VM of the other region started the last unit; its claim is fresh
+    assert bg.claim(claims, f"claims/{names[2]}", {"owner": "vm-eu/h1", "run": "4"}, bg.LEASE_SECONDS)
+    calls = []
+    me = dict(ME, work_dir=str(tmp_path), region="us-central2")
+    done = bg.work_units(units_of(names), store, me, fake_translate(calls), log=lambda s: None, claims=claims)
+    assert done == names[:2] and calls == names[:2]
+    assert {k for k in claims.list("claims/")} == set(names)
+    assert json.loads(claims.read(f"claims/{names[0]}")[0])["owner"] == "vm-a/h0"
+    assert json.loads(claims.read(f"claims/{names[2]}")[0])["owner"] == "vm-eu/h1"
+    assert store.list("claims/") == set()
+    assert store.list("shards/") == {f"{n}.parquet" for n in names[:2]}
+    assert claims.list("shards/") == set()
+
+
+def test_without_a_claims_store_the_claims_are_in_the_store(tmp_path):
+    store = bg.MemoryStore()
+    names = [f"rechtspraak/train-xlong-{k:04d}" for k in range(2)]
+    done = bg.work_units(units_of(names), store, dict(ME, work_dir=str(tmp_path)), fake_translate([]),
+                         log=lambda s: None)
+    assert done == names
+    assert store.list("claims/") == set(names)
+
+
 def test_backward_is_the_reverse_order():
     assert bg.ordered([1, 2, 3], "backward") == [3, 2, 1] and bg.ordered([1, 2, 3], "forward") == [1, 2, 3]
 
