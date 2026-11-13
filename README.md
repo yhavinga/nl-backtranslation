@@ -19,7 +19,7 @@ published, and to the dates of its decisions. "Worker" and "host" are the 4 host
 
 The pairs are published on Hugging Face as one dataset per source of original Dutch text. Each dataset card describes
 the selection from that source, the scores, the license and the known limitations of the pairs. Together they form the collection
-[Dutch back-translation (nl→en)](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-6af45e2ba548b444c6362255).
+[Dutch back-translation (nl→en), TranslateGemma](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-translategemma-6af45e2ba548b444c6362255).
 
 | dataset | Dutch source | license |
 |---|---|---|
@@ -31,6 +31,19 @@ the selection from that source, the scores, the license and the known limitation
 
 The English translations in all five were made with TranslateGemma and fall under the
 [Gemma Terms of Use](https://ai.google.dev/gemma/terms) as well.
+
+`gemma4_bt/` adds a second English translation, by Gemma 4 31B-it, to every row. These versions are published as five
+datasets with the suffix `-gemma4` (same rows, splits and columns, plus `en_gemma4` and its checks; Gemma 4 is under
+the Apache License 2.0), in the collection
+[Dutch back-translation (nl→en), Gemma 4](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-gemma-4-6af71821b216382e74d50896):
+
+| dataset |
+|---|
+| [yhavinga/fineweb-2-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/fineweb-2-nl-backtranslated-en-gemma4) |
+| [yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/handelingen-tweede-kamer-nl-backtranslated-en-gemma4) |
+| [yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/openraadsinformatie-nl-backtranslated-en-gemma4) |
+| [yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/rijksoverheid-websites-nl-backtranslated-en-gemma4) |
+| [yhavinga/rechtspraak-nl-backtranslated-en-gemma4](https://huggingface.co/datasets/yhavinga/rechtspraak-nl-backtranslated-en-gemma4) |
 
 ## Sources and models
 
