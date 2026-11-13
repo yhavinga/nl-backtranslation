@@ -14,7 +14,7 @@ found Gemma 4 with the prompt natural-v1 near the human length (1.019) but with 
     python bt_gemma4.py final --plan DIR --root gs://.../full --repo REPO --work-dir DIR
     python bt_gemma4.py card --prompt P --out README.md
     python bt_gemma4.py report --data DIR --out bt-gemma4.md
-    python bt_gemma4.py datasets --data DIR --sources DIR --out DIR
+    python bt_gemma4.py datasets --data DIR --sources DIR --out DIR [--standalone]
 
 fetch: the five datasets of SOURCES (TranslateGemma 27B's English of each Dutch passage, with its scores and checks)
 at fixed revisions, straight from Hugging Face.
@@ -42,7 +42,9 @@ new English and its checks, as one parquet file into a private dataset on Huggin
 Nothing is filtered out. final makes the report (report) once every unit is there.
 
 Step 3, one dataset per source (datasets): from a local copy of the merged dataset and of the source datasets (fetch),
-per source the files of the source dataset, each with the same rows in the same order and the new columns.
+per source the files of the source dataset, each with the same rows in the same order and the new columns. With
+--standalone (the published datasets) without TranslateGemma's columns, and Gemma 4's under the plain names
+(standalone()).
 """
 
 import argparse
@@ -1192,10 +1194,46 @@ def final(args):
     print(f"FINAL report in {args.root}/report/", flush=True)
 
 
+# The columns a standalone dataset leaves out: TranslateGemma's translation, back-translation, scores and checks, the
+# token count and length class of its tokenizer, the word ratio of its English, and gemma4_r2_length_out, whose bound
+# is a factor around the median of TranslateGemma's pairs. sentences_nl stays: it counts the sentences of nl alone.
+TRANSLATEGEMMA_COLUMNS = ("en", "nl_back", "qe_en_nl", "chrf", "tokens_nl", "tokens_en", "length_class", "len_ratio",
+                          "sentences_en", "numbers_missing", "structure", "ended", "decode_loop", "dutch_left",
+                          "back_ended", "back_decode_loop", "back_structure", "hard_fails", "tg_word_ratio",
+                          "gemma4_r2_length_out")
+# Gemma 4's columns that take the places of TranslateGemma's (new name -> column of the merged dataset)
+IN_PLACE = {"en": "en_gemma4", "tokens_nl": "gemma4_tokens_nl"}
+
+
+def standalone(table):
+    """A table of a dataset per source without TranslateGemma: the columns of TRANSLATEGEMMA_COLUMNS left out,
+    en_gemma4 as en and gemma4_<x> as <x>. en and tokens_nl (Gemma 4 tokens) stand where TranslateGemma's stood, the
+    other Gemma 4 columns follow in their order; every other column stays where it is."""
+    names = table.column_names
+    missing = [c for c in ("en", "tokens_nl", *IN_PLACE.values()) if c not in names]
+    if missing:
+        raise SystemExit(f"not a dataset per source with Gemma 4's columns: {missing} missing")
+    renamed = {"en_gemma4": "en", **{c: c[len("gemma4_"):] for c in names
+                                     if c.startswith("gemma4_") and c not in TRANSLATEGEMMA_COLUMNS}}
+    order = []
+    for c in names:
+        if c in IN_PLACE:
+            order.append(IN_PLACE[c])
+        elif c not in TRANSLATEGEMMA_COLUMNS and c not in renamed:
+            order.append(c)
+    order += [c for c in names if c in renamed and c not in IN_PLACE.values()]
+    new_names = [renamed.get(c, c) for c in order]
+    twice = sorted({n for n in new_names if new_names.count(n) > 1})
+    if twice:
+        raise SystemExit(f"columns twice after dropping the prefix gemma4_: {twice}")
+    return table.select(order).rename_columns(new_names)
+
+
 def datasets(args):
     """One dataset per source of SOURCES, in --out/<key>/: the files of the source dataset (its local copy in
     --sources, as fetch wrote it), each with the same rows in the same order; every row has the source's columns,
-    checked to be unchanged, and the new ones of the merged dataset (--data: a local copy, one directory per part)"""
+    checked to be unchanged, and the new ones of the merged dataset (--data: a local copy, one directory per part).
+    With --standalone each file is standalone() of that."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -1221,6 +1259,8 @@ def datasets(args):
                 rows = merged.take(take)
                 if not rows.select(source.column_names).equals(source):
                     raise SystemExit(f"{part}/{path.name}: the merged rows differ from the source's in its columns")
+                if args.standalone:
+                    rows = standalone(rows)
                 target = out / key / folder / path.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 pq.write_table(rows, target, compression="zstd")
@@ -1306,6 +1346,8 @@ def main(argv=None):
     p.add_argument("--data", required=True, help="A local copy of the merged dataset (one directory per part)")
     p.add_argument("--sources", required=True, help="The source datasets as fetch wrote them")
     p.add_argument("--out", required=True)
+    p.add_argument("--standalone", action="store_true",
+                   help="Without TranslateGemma's columns, Gemma 4's under the plain names (standalone())")
     args = parser.parse_args(argv)
     if getattr(args, "expect", None) == 0:
         args.expect = None

@@ -434,6 +434,65 @@ def test_datasets_refuses_changed_source_columns_and_rows_of_no_source(tmp_path)
         bg.main(["datasets", "--data", str(merged), "--sources", str(sources), "--out", str(tmp_path / "o3")])
 
 
+def per_source_row(i):
+    """A row of a dataset per source as datasets writes it without --standalone (the columns in that order)"""
+    return {"id": f"dpc:{i}", "gptnl_doc_id": "d", "nl": f"tekst {i}", "en": f"tg {i}", "nl_back": "terug",
+            "qe_en_nl": 1.0, "chrf": 60.0, "tokens_nl": 7, "tokens_en": 8, "length_class": "short", "len_ratio": 1.1,
+            "sentences_nl": 1, "sentences_en": 1, "numbers_missing": [], "structure": [], "ended": True,
+            "decode_loop": False, "dutch_left": False, "back_ended": True, "back_decode_loop": False,
+            "back_structure": [], "hard_fails": ["len_ratio"], "source_score": 0.9, "topic": "t",
+            "en_gemma4": f"g4 {i}", "gemma4_ended": False, "gemma4_tokens_nl": 6 + i, "gemma4_tokens_out": 9,
+            "gemma4_prompt": "natural-v1-fmt", "gemma4_hard_fails": ["chatter"], "gemma4_structure": ["bold"],
+            "gemma4_len_ratio": 1.2, "gemma4_numbers_missing": ["3"], "gemma4_word_ratio": 1.0,
+            "tg_word_ratio": 0.9, "gemma4_char_ratio": 1.05, "gemma4_r2_length_out": True, "gemma4_time": "t"}
+
+
+def test_standalone_leaves_out_translategemma_and_drops_the_prefix_of_gemma_4():
+    import pyarrow as pa
+
+    table = bg.standalone(pa.Table.from_pylist([per_source_row(0), per_source_row(1)]))
+    assert table.column_names == [
+        "id", "gptnl_doc_id", "nl", "en", "tokens_nl", "sentences_nl", "source_score", "topic", "ended", "tokens_out",
+        "prompt", "hard_fails", "structure", "len_ratio", "numbers_missing", "word_ratio", "char_ratio", "time"]
+    rows = table.to_pylist()
+    assert [r["en"] for r in rows] == ["g4 0", "g4 1"] and [r["tokens_nl"] for r in rows] == [6, 7]
+    assert rows[0]["hard_fails"] == ["chatter"] and rows[0]["structure"] == ["bold"] and rows[0]["ended"] is False
+    assert rows[0]["numbers_missing"] == ["3"] and rows[0]["len_ratio"] == 1.2
+
+
+def test_standalone_refuses_a_table_without_gemma_4_or_with_a_name_twice():
+    import pyarrow as pa
+
+    row = per_source_row(0)
+    with pytest.raises(SystemExit, match=r"\['en_gemma4'\] missing"):
+        bg.standalone(pa.Table.from_pylist([{k: v for k, v in row.items() if k != "en_gemma4"}]))
+    with pytest.raises(SystemExit, match=r"twice .*\['topic'\]"):
+        bg.standalone(pa.Table.from_pylist([dict(row, gemma4_topic="x")]))
+
+
+def test_datasets_standalone_writes_the_published_schema(tmp_path):
+    import pyarrow.parquet as pq
+
+    sources, merged = tmp_path / "src", tmp_path / "merged"
+    # the source dataset's columns: those of a row per source without the merged dataset's new ones
+    tg_columns = [k for k in per_source_row(0) if not k.startswith("gemma4_") and k not in ("en_gemma4", "tg_word_ratio")]
+    for part, (key, folder) in bg.PARTS.items():
+        rows = []
+        for split in bg.SPLITS:
+            row = dict(per_source_row(0), id=f"{part}:{split}")
+            bg.write_parquet([{k: row[k] for k in tg_columns}],
+                             sources / key / folder / f"{split}-00000-of-00001.parquet")
+            rows.append(row)
+        bg.write_parquet(rows, merged / part / "train-small-0000.parquet")
+    bg.main(["datasets", "--data", str(merged), "--sources", str(sources), "--out", str(tmp_path / "out"),
+             "--standalone"])
+    table = pq.read_table(tmp_path / "out" / "handelingen" / "context_turns" / "validation-00000-of-00001.parquet")
+    assert table.column("id").to_pylist() == ["handelingen_context:validation"]
+    assert table.column("en").to_pylist() == ["g4 0"] and "en_gemma4" not in table.column_names
+    assert not set(table.column_names) & {"nl_back", "qe_en_nl", "chrf", "tg_word_ratio", "r2_length_out",
+                                          "length_class", "tokens_en"}
+
+
 @pytest.mark.skipif(not (GEMMA4_TOKENIZER / "tokenizer.json").exists(), reason="Gemma 4's tokenizer is not here")
 def test_the_probes_prompts_fit_every_class_of_the_bt_model():
     from transformers import AutoTokenizer

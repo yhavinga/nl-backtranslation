@@ -7,9 +7,9 @@ A training pair is the synthetic English as the source and the original Dutch as
 
 TranslateGemma's English is wordier than a human translation (a median of 0.960 Dutch words per English word on 200
 random passages, against about 1.06 for human translations), and a translator trained on it learns to compress.
-`gemma4_bt/` therefore translates the same 271,710 Dutch passages into English once more, with Gemma 4 31B-it and a
-prompt chosen by a rule fixed in advance (see [Gemma 4 back-translation](#gemma-4-back-translation)). It adds a
-column `en_gemma4` and its checks to every row of the five datasets; the TranslateGemma pipeline and its columns stay
+`gemma4_bt/` therefore translates the same 271,710 Dutch passages into English with Gemma 4 31B-it and a prompt
+chosen by a rule fixed in advance (see [Gemma 4 back-translation](#gemma-4-back-translation)). Its output is published
+as five datasets of its own, with Gemma 4's English and its checks; the TranslateGemma pipeline and its datasets stay
 as they are.
 
 The comments in the code refer to the design of the experiment the pairs were made for ("design §3"), which is not
@@ -32,10 +32,13 @@ the selection from that source, the scores, the license and the known limitation
 The English translations in all five were made with TranslateGemma and fall under the
 [Gemma Terms of Use](https://ai.google.dev/gemma/terms) as well.
 
-`gemma4_bt/` adds a second English translation, by Gemma 4 31B-it, to every row. These versions are published as five
-datasets with the suffix `-gemma4` (same rows, splits and columns, plus `en_gemma4` and its checks; Gemma 4 is under
-the Apache License 2.0), in the collection
-[Dutch back-translation (nl→en), Gemma 4](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-gemma-4-6af71821b216382e74d50896):
+The English translations by Gemma 4 31B-it (`gemma4_bt/`) are published as five datasets with the suffix `-gemma4`,
+in the collection
+[Dutch back-translation (nl→en), Gemma 4](https://huggingface.co/collections/yhavinga/dutch-back-translation-nlen-gemma-4-6af71821b216382e74d50896).
+Each has the Dutch passages, splits and configs of the dataset of the same source above, with the columns of the
+passage, its source and its selection; `en` is Gemma 4's English, followed by its checks (the columns are listed under
+step 5 of [Gemma 4 back-translation](#gemma-4-back-translation)). They have no TranslateGemma columns. The license of each is
+that of its source; Gemma 4 is under the Apache License 2.0.
 
 | dataset |
 |---|
@@ -203,9 +206,10 @@ Nothing is filtered after translation: a training set is a query on `pairs.parqu
 `gemma4_bt/` translates the 271,710 Dutch passages and context turns of the five datasets (`bt_gemma4.py`, `SOURCES`:
 the revisions of 11 Nov 2026) from Dutch into English again, with `google/gemma-4-31B-it` at `842da37`, greedy, in
 MaxText on spot v6e-8 VMs. Gemma 4 31B allows at most 4-way tensor parallelism, so each VM runs two processes of 4
-chips. Nothing is filtered out: every row keeps all columns of its source dataset (TranslateGemma's English stays in
-`en`) and gets `en_gemma4`, the checks of the pair (`nl`, `en_gemma4`) as `gemma4_*` columns (the hard checks of
-`pairs.py`, and `chatter`: an introduction or a note around the translation), and `tg_word_ratio`.
+chips. Nothing is filtered out: in the merged dataset every row keeps all columns of its source dataset
+(TranslateGemma's English stays in `en`) and gets `en_gemma4`, the checks of the pair (`nl`, `en_gemma4`) as
+`gemma4_*` columns (the hard checks of `pairs.py`, and `chatter`: an introduction or a note around the translation),
+and `tg_word_ratio`.
 
 ### The prompt
 
@@ -256,8 +260,25 @@ output.
    `full/report/`, and the keeper deletes the VMs and ends.
 5. **One dataset per source**, on any machine with a copy of `REPO` and of the sources: `python gemma4_bt/bt_gemma4.py
    fetch --out sources`, then `python gemma4_bt/bt_gemma4.py datasets --data <copy of REPO> --sources sources --out
-   per-source` writes per source the files of the source dataset (`data/`, and `context_turns/` for the Handelingen),
-   each with the same rows in the same order and the new columns; it checks that every source column is unchanged.
+   per-source --standalone` writes per source the files of the source dataset (`data/`, and `context_turns/` for the
+   Handelingen), each with the same rows in the same order; it checks that every source column is unchanged. With
+   `--standalone` (the published `-gemma4` datasets) each file leaves out the columns of `TRANSLATEGEMMA_COLUMNS`
+   (TranslateGemma's English, back-translation, scores and checks; `tokens_nl` and `length_class`, counted with its
+   tokenizer; `tg_word_ratio`; and `gemma4_r2_length_out`, a bound set on its pairs) and drops the prefix of Gemma 4's
+   columns: `en_gemma4` becomes `en`, `gemma4_<x>` becomes `<x>`, and `tokens_nl` counts Gemma 4 tokens. Without
+   `--standalone` every row keeps all columns of its source dataset next to the new ones.
+
+   | column of a `-gemma4` dataset | meaning |
+   |---|---|
+   | `id`, `nl`, the source's metadata, `sentences_nl`, `source_score`, `origin_score`, `topic`, `half`, ... | the Dutch passage, its source and its selection, as in the source dataset |
+   | `en` | Gemma 4 31B-it's English translation of `nl` (greedy) |
+   | `tokens_nl`, `tokens_out` | Gemma 4 tokens of `nl` and of the output (with the stop token) |
+   | `ended` | the translation stopped by itself |
+   | `prompt`, `prompt_text`, `model` | the prompt's name and its text (`{text}` stands for `nl`); model and revision |
+   | `hard_fails` | the checks the pair (`nl`, `en`) fails: `not_ended`, `decode_loop`, `dutch_left`, `len_ratio`, `structure`, `newline_doubled` (`pairs.hard_fails`) and `chatter` |
+   | `structure`, `chatter`, `decode_loop`, `dutch_left`, `len_ratio`, `numbers_missing` | the measures behind the checks |
+   | `word_ratio`, `char_ratio` | Dutch words per English word (split on whitespace); Dutch characters over English characters |
+   | `region`, `vm`, `time` | where and when the translation was made |
 
 The length of a passage is a setting: a set of longer passages needs length classes of its own in `models.yml` (a new
 model entry) and `bt_gemma4.py plan --model <entry> --max-source <tokens>`.
