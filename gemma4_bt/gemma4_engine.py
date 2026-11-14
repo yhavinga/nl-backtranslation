@@ -257,6 +257,16 @@ def translate_shard(device, codec, tokenizer, ids, texts, shapes, sync_every, eo
     return rows, seconds
 
 
+def peak_memory():
+    """The peak HBM of this process's chips so far (GiB) and their limit, as translate.py's MEM line"""
+    import jax
+
+    stats = [d.memory_stats() or {} for d in jax.local_devices()]
+    peaks = [round(s.get("peak_bytes_in_use", 0) / 2 ** 30, 3) for s in stats]
+    return {"peak_gib_max": max(peaks), "peak_gib": peaks,
+            "limit_gib": round(min(s.get("bytes_limit", 0) for s in stats) / 2 ** 30, 3)}
+
+
 # The bucket through the Python client, not gsutil: on the v6e image gsutil is a snap, and a snap refuses to start
 # ("need to run as root or suid") under a process with no_new_privs, which this one has once libtpu is up.
 # google-cloud-storage comes with maxtext[tpu].

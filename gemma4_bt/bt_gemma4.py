@@ -260,6 +260,24 @@ def class_of(tokens, classes):
     raise SystemExit(f"a segment of {tokens} tokens is longer than the largest class")
 
 
+def class_holding(tokens, decode, classes):
+    """The first class whose max_source holds a segment of tokens and whose max_decode holds decode tokens, or None
+    (a model with move_up: a round trip whose original Dutch is long for its English goes up a class)"""
+    for name, c in classes.items():
+        if tokens <= c["max_source"] and decode <= c["max_decode"]:
+            return name
+    return None
+
+
+def shard_sizes(model, shard_size):
+    """The passages of a unit per class: shard_slots x the class's slots where the model sets shard_slots (classes
+    of very different slots), shard_size otherwise"""
+    m = ge.MODELS[model]
+    if "shard_slots" in m:
+        return {c: m["shard_slots"] * m["slots"][c] for c in m["length_classes"]}
+    return {c: shard_size for c in m["length_classes"]}
+
+
 # ---------------------------------------------------------------------------------------------------- stores
 
 class MemoryStore:
@@ -437,11 +455,13 @@ def plan_hash(units):
 
 
 def make_units(segments_by_key, class_names, shard_size, part_order):
-    """Units of shard_size consecutive segments of one (part, split, class), in the order class, part, split, k"""
+    """Units of shard_size consecutive segments of one (part, split, class), in the order class, part, split, k;
+    shard_size an int, or one per class"""
     units = []
     for (part, split, cls), (path, rows) in segments_by_key.items():
-        for k, start in enumerate(range(0, len(rows), shard_size)):
-            chunk = rows[start:start + shard_size]
+        size = shard_size[cls] if isinstance(shard_size, dict) else shard_size
+        for k, start in enumerate(range(0, len(rows), size)):
+            chunk = rows[start:start + size]
             units.append({"name": f"{part}/{split}-{cls}-{k:04d}", "part": part, "split": split, "class": cls,
                           "prompt": None, "segments": path, "start": start, "end": start + len(chunk),
                           "n": len(chunk), "first": chunk[0]["id"], "last": chunk[-1]["id"]})
@@ -455,7 +475,9 @@ def plan(args):
     nl, translated into English; en, the round trip, translated back into Dutch) in the model's classes; a passage
     above --max-source (default the largest class) stops the plan. For the round trip (--text en, the -gemma4
     datasets) every passage's original Dutch (tokens_nl, Gemma 4 tokens) times DECODE_MARGIN must fit the decode
-    limit of its class."""
+    limit of its class; with a model that sets move_up such a passage goes to the first later class that holds both.
+    --parts: only these parts (a set of other passages, as the long ones of bt_long.py). --check-prompt: every
+    passage's prompt (that prompt in the model's turn, Gemma 4 tokens) fits the largest prefill length of its class."""
     model = args.model or (RT_MODEL if args.text == "en" else MODEL)
     classes = classes_of(model)
     names = list(classes)
@@ -463,10 +485,17 @@ def plan(args):
     max_source = args.max_source or largest
     if max_source > largest:
         raise SystemExit(f"--max-source {max_source} is beyond the largest class of {model} ({largest})")
+    parts = args.parts.split(",") if args.parts else list(PARTS)
+    unknown = [p for p in parts if p not in PARTS]
+    if unknown:
+        raise SystemExit(f"--parts: {unknown} are no parts ({', '.join(PARTS)})")
+    move_up = args.text == "en" and ge.MODELS[model].get("move_up", False)
+    source, target = ("en", "nl") if args.text == "en" else ("nl", "en")
+    codec = ge.TurnCodec(None, ge.MODELS[model], args.check_prompt, source, target) if args.check_prompt else None
     count = Counter(args.tokenizer)
     out = Path(args.out)
-    segments_by_key, total = {}, 0
-    for part in PARTS:
+    segments_by_key, total, longest_prompt = {}, 0, {}
+    for part in parts:
         for split in SPLITS:
             columns = ["id", args.text] + (["tokens_nl"] if args.text == "en" else [])
             table = read_part(args.data, part, split, columns)
@@ -475,15 +504,27 @@ def plan(args):
             over = [i for i, n in zip(ids, tokens) if n > max_source]
             if over:
                 raise SystemExit(f"{part}/{split}: {len(over)} passages above {max_source} tokens, e.g. {over[:3]}")
+            cls_of = [class_of(n, classes) for n in tokens]
             if args.text == "en":
-                short = [i for i, n, n_nl in zip(ids, tokens, table.column("tokens_nl").to_pylist())
-                         if n_nl * DECODE_MARGIN > classes[class_of(n, classes)]["max_decode"]]
+                dutch = table.column("tokens_nl").to_pylist()
+                if move_up:
+                    cls_of = [class_holding(n, n_nl * DECODE_MARGIN, classes) for n, n_nl in zip(tokens, dutch)]
+                    short = [i for i, c in zip(ids, cls_of) if c is None]
+                else:
+                    short = [i for i, c, n_nl in zip(ids, cls_of, dutch) if n_nl * DECODE_MARGIN > classes[c]["max_decode"]]
                 if short:
                     raise SystemExit(f"{part}/{split}: {len(short)} passages whose original Dutch times "
                                      f"{DECODE_MARGIN} exceeds the decode limit of their class, e.g. {short[:3]}")
+            if codec is not None:
+                for i, c, n in zip(ids, cls_of, count.many(codec.text(t) for t in texts)):
+                    limit = classes[c]["prefill_lengths"][-1]
+                    if n > limit:
+                        raise SystemExit(f"{i}: its prompt {args.check_prompt} has {n} tokens, more than the prefill "
+                                         f"length {limit} of its class {c}")
+                    longest_prompt[c] = max(longest_prompt.get(c, 0), n)
             per = collections.defaultdict(list)
-            for i, text, n in zip(ids, texts, tokens):
-                per[class_of(n, classes)].append({"id": i, "text": text, "tokens": n})
+            for i, text, n, c in zip(ids, texts, tokens, cls_of):
+                per[c].append({"id": i, "text": text, "tokens": n})
             for cls, rows in per.items():
                 rel = f"segments/{part}/{split}-{cls}.parquet"
                 segments_by_key[(part, split, cls)] = (rel, write_segments(rows, out / rel))
@@ -491,10 +532,16 @@ def plan(args):
             print(f"PLAN {json.dumps({'part': part, 'split': split, 'passages': len(ids), 'classes': {c: len(r) for c, r in sorted(per.items())}})}", flush=True)
     if args.expect is not None and total != args.expect:
         raise SystemExit(f"{total} passages, expected {args.expect}")
-    units = make_units(segments_by_key, names, args.shard_size, list(PARTS))
-    info = {"model": model, "classes": classes, "max_source": max_source, "shard_size": args.shard_size,
+    sizes = shard_sizes(model, args.shard_size)
+    units = make_units(segments_by_key, names, sizes, list(PARTS))
+    info = {"model": model, "classes": classes, "max_source": max_source,
+            "shard_size": sizes if "shard_slots" in ge.MODELS[model] else args.shard_size,
             "passages": total, "units": units, "hash": plan_hash(units),
             "revisions": {k: v[1] for k, v in (ROUNDTRIP_SOURCES if args.text == "en" else SOURCES).items()}}
+    if args.parts:
+        info["parts"] = parts
+    if codec is not None:
+        info["longest_prompt"] = longest_prompt
     if args.text == "en":  # the languages of a plan; a plan without them is nl->en
         info.update(source="en", target="nl")
     (out / "units.json").write_text(json.dumps(info, indent=0))
@@ -672,7 +719,8 @@ class Translator:
     def __init__(self, args, plan_info):
         self.args, self.plan = args, plan_info
         self.model = ge.MODELS[plan_info["model"]]
-        self.shapes = dict(plan_info["classes"][args.length_class], slots=self.model["slots"][args.length_class])
+        slots = getattr(args, "slots", None) or self.model["slots"][args.length_class]
+        self.shapes = dict(plan_info["classes"][args.length_class], slots=slots)
         self.device = self.tokenizer = None
         self.codecs, self.tables = {}, {}
 
@@ -716,6 +764,7 @@ class Translator:
         codec.check(texts[:2] + texts[-1:])
         out, seconds = ge.translate_shard(self.device, codec, self.tokenizer, [r["id"] for r in rows], texts,
                                           self.shapes, self.args.sync_every, self.model["eos_ids"])
+        print(f"MEM {json.dumps({'unit': u['name'], 'slots': self.shapes['slots'], **ge.peak_memory()})}", flush=True)
         u["prompt"] = prompt
         return out, seconds
 
@@ -1483,6 +1532,9 @@ def main(argv=None):
                    help="The largest passage in Gemma 4 tokens (default: the model's largest class)")
     p.add_argument("--shard-size", type=int, default=SHARD_SIZE)
     p.add_argument("--expect", type=int, default=EXPECTED_PASSAGES, help="Passages expected (0: no check)")
+    p.add_argument("--parts", default=None, help="Only these parts, comma-separated (default: all of PARTS)")
+    p.add_argument("--check-prompt", default=None,
+                   help="A prompt of models.yml: every passage's prompt must fit the prefill length of its class")
     p.add_argument("--out", required=True)
     p = sub.add_parser("work")
     p.add_argument("--plan", required=True)
@@ -1502,6 +1554,8 @@ def main(argv=None):
     p.add_argument("--ckpt", required=True, help="Gemma 4's MaxText checkpoint in this region: <checkpoint>/0/items")
     p.add_argument("--work-dir", required=True)
     p.add_argument("--sync-every", type=int, default=8)
+    p.add_argument("--slots", type=int, default=None,
+                   help="Decode slots of the class instead of models.yml's (a class that ran out of memory there)")
     p = sub.add_parser("status")
     p.add_argument("--plan", required=True)
     p.add_argument("--root", required=True)

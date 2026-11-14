@@ -8,10 +8,13 @@
 # MetricX-24 (CPU torch, to read its pytorch_model*.bin) need. Without JetStream: gemma4_engine.py registers MaxText's
 # stub ResultTokens as a pytree where it is not one yet. tokenizer-gemma4: Gemma 4 31B-it's tokenizer and chat template
 # at the revision of models.yml. Needs ~/.cache/huggingface/token; the token is never printed.
+# From the environment (the long passages, run_bt_long.sh): SHM, another directory, and FORK_COMMIT, another commit of
+# the fork (f4d8615 of branch fix-decode-cache-shared-index: decode limits above the sliding window of 1,024 with
+# slots used again); a venv there of another commit is refused.
 set -euo pipefail
-SHM=/dev/shm/bt_gemma4
+SHM=${SHM:-/dev/shm/bt_gemma4}
 FORK=https://github.com/yhavinga/maxtext.git
-FORK_COMMIT=2249474b93b971d8248520e3a09b94b4ce626ce4
+FORK_COMMIT=${FORK_COMMIT:-2249474b93b971d8248520e3a09b94b4ce626ce4}
 GEMMA4=google/gemma-4-31B-it
 GEMMA4_REV=842da3794eaa0b77d5f08bae87a17459d91ff475
 export PATH=$HOME/.local/bin:$PATH UV_CACHE_DIR=$SHM/uv-cache UV_PYTHON_INSTALL_DIR=$SHM/python HF_HUB_DISABLE_PROGRESS_BARS=1
@@ -35,6 +38,7 @@ if [ ! -s "$V/done.txt" ]; then
     | tee "$V/done.txt"
 fi
 cat "$V/done.txt"
+grep -q "$FORK_COMMIT" "$V/done.txt" || { echo "$(hostname): $V is not MaxText at $FORK_COMMIT"; exit 1; }
 T=$SHM/tokenizer-gemma4
 if [ ! -s "$T/tokenizer.json" ]; then
   "$V/bin/python" -c "from huggingface_hub import snapshot_download as s; s('$GEMMA4', revision='$GEMMA4_REV', local_dir='$T', allow_patterns=['tokenizer*', 'chat_template.jinja', 'config.json', 'generation_config.json'])"

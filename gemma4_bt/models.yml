@@ -88,3 +88,61 @@ models:
       long: {max_source: 384, prefill_lengths: [448, 576], max_decode: 704}
       xlong: {max_source: 512, prefill_lengths: [576, 704], max_decode: 704}
     slots: {tiny: 160, small: 68, medium: 44, long: 36, xlong: 32}
+  # Long passages (bt_long.py): more than 512 and at most 2,048 Gemma 4 tokens, each translated whole, from Dutch into
+  # English. They need the MaxText fork at f4d8615 (branch fix-decode-cache-shared-index; gemma4_bt/setup.sh with
+  # FORK_COMMIT): before it, all slots shared one index into the decode cache, and a passage inserted into a slot that
+  # was used before lost the newest tokens from Gemma 4's sliding window of 1,024 once its decode ran past the end of
+  # the cache (loops). One prefill length per class, 128 above max_source (natural-v1-fmt takes 114 tokens beside the
+  # text; plan --check-prompt checks every passage); max_decode 1.25 x max_source (nl->en gives ~0.77 output tokens per
+  # source token). Memory, measured on a v4 chip (30.75 GiB, one process of 4 chips) with these shapes on 14 Nov 2026:
+  # prefill 1152 / decode 1280 with 16 slots 28.75 GiB, with 4 slots 19.07; prefill 2176 / decode 2560 with 4 slots
+  # 23.56, with 8 out of memory. The fit through the first three, 15.84 GiB + 0.34 MiB per slot-token (slots x
+  # (prefill + decode)) + 1.4 MiB per prefill token above 1152, puts every other class at most at ~28.2 GiB (the 8
+  # slots of 2176 / 2560 that ran out of memory: 29.85). The slots are a whole number per chip. A unit holds shard_slots x the
+  # class's slots passages; the smoke test of bt_long.py measures every class, and a class that runs out of memory
+  # there runs with its fallback_slots.
+  gemma4-31b-bt-long:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-fmt
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    shard_slots: 16
+    length_classes:
+      l640: {max_source: 640, prefill_lengths: [768], max_decode: 800}
+      l768: {max_source: 768, prefill_lengths: [896], max_decode: 960}
+      l1k: {max_source: 1024, prefill_lengths: [1152], max_decode: 1280}
+      l1280: {max_source: 1280, prefill_lengths: [1408], max_decode: 1600}
+      l1536: {max_source: 1536, prefill_lengths: [1664], max_decode: 1920}
+      l1792: {max_source: 1792, prefill_lengths: [1920], max_decode: 2240}
+      l2k: {max_source: 2048, prefill_lengths: [2176], max_decode: 2560}
+    slots: {l640: 24, l768: 20, l1k: 16, l1280: 12, l1536: 8, l1792: 8, l2k: 4}
+    fallback_slots: {l640: 16, l768: 16, l1k: 12, l1280: 8, l1536: 4, l1792: 4, l2k: 4}
+  # The round trip of the long passages: their English back into Dutch, in classes of the English's Gemma 4 tokens
+  # whose decode limit holds 1.25 x the original Dutch (DECODE_MARGIN). English has ~0.77 of the Dutch's tokens, so a
+  # class takes English up to ~0.9 x its Dutch bound; with move_up a passage whose Dutch is long for its English goes
+  # to the first later class that holds both. r2560 takes an English longer than any Dutch passage (a translation that
+  # ran to its decode limit). Shapes, slots and memory as gemma4-31b-bt-long (the same fit).
+  gemma4-31b-rt-long:
+    maxtext_model: gemma4-31b
+    hf_repo: google/gemma-4-31B-it
+    revision: 842da3794eaa0b77d5f08bae87a17459d91ff475
+    chips: 4
+    eos_ids: [1, 106, 50]
+    prompt: natural-v1-fmt
+    turn: {prefix: "<bos><|turn>user\n", suffix: "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>", check: true}
+    shard_slots: 16
+    move_up: true
+    length_classes:
+      r640: {max_source: 576, prefill_lengths: [704], max_decode: 800}
+      r768: {max_source: 704, prefill_lengths: [832], max_decode: 960}
+      r1k: {max_source: 896, prefill_lengths: [1024], max_decode: 1280}
+      r1280: {max_source: 1152, prefill_lengths: [1280], max_decode: 1600}
+      r1536: {max_source: 1408, prefill_lengths: [1536], max_decode: 1920}
+      r1792: {max_source: 1664, prefill_lengths: [1792], max_decode: 2240}
+      r2k: {max_source: 2048, prefill_lengths: [2176], max_decode: 2560}
+      r2560: {max_source: 2560, prefill_lengths: [2688], max_decode: 2560}
+    slots: {r640: 24, r768: 20, r1k: 16, r1280: 12, r1536: 8, r1792: 8, r2k: 4, r2560: 4}
+    fallback_slots: {r640: 16, r768: 16, r1k: 12, r1280: 8, r1536: 4, r1792: 4, r2k: 4, r2560: 4}
