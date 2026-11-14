@@ -495,3 +495,13 @@ def test_the_budget_lowers_the_passages_per_source_until_the_estimate_fits(tmp_p
     b = json.loads((tmp_path / "budget.json").read_text())
     assert b["n"] == 25 and b["per_source"] == {s: 25 for s in bl.SOURCE_KEYS} and b["target"] == 1000
     assert b["estimate"]["worker_hours"] <= 2
+
+
+def test_contains_any_finds_a_value_of_a_sorted_array():
+    import numpy as np
+
+    a = np.array(sorted([3, 10, 2 ** 63 + 5, 42]), dtype=np.uint64)
+    assert bl.contains_any(a, np.array([7, 42], dtype=np.uint64))
+    assert bl.contains_any(a, np.array([2 ** 63 + 5], dtype=np.uint64))
+    assert not bl.contains_any(a, np.array([0, 11, 2 ** 64 - 1], dtype=np.uint64))
+    assert not bl.contains_any(a, np.array([], dtype=np.uint64))

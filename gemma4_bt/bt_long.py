@@ -550,6 +550,17 @@ def back_ratio(data, above=384):
     return round(out / n, 4)
 
 
+def contains_any(sorted_array, values):
+    """Whether any of values (uint64) is in sorted_array: a binary search per value (np.isin would sort the 29 M
+    13-grams of the existing passages again for every candidate)"""
+    import numpy as np
+
+    if not len(values) or not len(sorted_array):
+        return False
+    idx = np.minimum(np.searchsorted(sorted_array, values), len(sorted_array) - 1)
+    return bool((sorted_array[idx] == values).any())
+
+
 def reconstruction_checks(data, source, rows, checker, n=400):
     """How well this module reproduces the existing rows: the split rule on their documents, and the idiom score and
     sentence count of a sample (both measured on nl, the text after the edits)"""
@@ -632,7 +643,7 @@ def candidates(args):
                     if grams & blocked:
                         skipped["test_set_13gram"] += 1
                         continue
-                    if np.isin(arr, taken_grams, assume_unique=True).any():
+                    if contains_any(taken_grams, arr):
                         skipped["existing_13gram"] += 1
                         continue
                     if grams & seen_grams:
