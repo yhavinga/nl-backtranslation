@@ -84,7 +84,7 @@ setup)
     HF_HUB_OFFLINE=0 py -c "from huggingface_hub import snapshot_download as s; s('google/gemma-4-31B-it', revision='842da3794eaa0b77d5f08bae87a17459d91ff475', local_dir='$TOK', allow_patterns=['tokenizer*', 'chat_template.jinja', 'config.json', 'generation_config.json'])"
   fi
   CKPT=$CKPT HF_HUB_OFFLINE=0 bash "$TOP/gemma_judge/setup.sh"
-  timeout 600 py -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())"
+  timeout 600 "$(cat "$SHM/venv.txt")/bin/python" -c "import jax; assert (jax.device_count(), jax.process_count()) == (4, 1), (jax.device_count(), jax.process_count()); print('devices', jax.devices())"
   echo "venv $V: $(py -c 'import importlib.metadata as m, json; print(json.loads(m.distribution("maxtext").read_text("direct_url.json"))["vcs_info"]["commit_id"])')"
   echo "STEP setup OK w$K $(df -h /dev/shm | tail -1 | awk '{print $4}') free in /dev/shm"
   ;;
