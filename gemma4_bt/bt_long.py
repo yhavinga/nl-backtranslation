@@ -626,6 +626,7 @@ def candidates(args):
         _STATE.update(taken=taken, splits=splits)
         groups = sp.row_groups(source, 10 ** 9, f"{SEED}/groups", fs)
         random.Random(f"{SEED}/{source}/order").shuffle(groups)
+        all_groups = len(groups)
         if args.max_groups:
             groups = groups[:args.max_groups]
         kept, seen_grams, per_host = [], set(), collections.Counter()
@@ -668,10 +669,11 @@ def candidates(args):
         table = pa.Table.from_pylist(kept)
         pq.write_table(table, out / f"{source}.parquet", compression="zstd")
         tokens = [r["tokens_nl"] for r in kept]
-        scale = 1 if read == len(groups) else len(groups) / max(read, 1)
-        info = {"row_groups": len(groups), "row_groups_read": read, "kept": len(kept),
+        # what the whole source holds, from the share of its row groups read (exact when all were read)
+        scale = all_groups / max(read, 1)
+        info = {"row_groups": all_groups, "row_groups_read": read, "kept": len(kept),
                 "kept_per_bin": {str(b): per_bin[b] for b in BINS}, "valid_per_bin": {str(b): valid[b] for b in BINS},
-                "scanned_all": read == len(groups), "counters": dict(counters), "skipped": dict(skipped),
+                "scanned_all": read == all_groups, "counters": dict(counters), "skipped": dict(skipped),
                 "available_estimate": round(sum(valid.values()) * scale),
                 "available_estimate_per_bin": {str(b): round(valid[b] * scale) for b in BINS},
                 "splits": dict(collections.Counter(r["split"] for r in kept)),
