@@ -456,10 +456,11 @@ def smoke_log(cls, units, slots, tokens=(1000, 1000), seconds=(20.0, 10.0)):
     lines = [f"MAXTEXT {json.dumps({'class': cls})}", "engine ready in 50 s"]
     for k in range(units):
         name = f"smoke/train-{cls}-{k:04d}"
+        # the order of bt_gemma4.py work: the engine's MEM line before the unit's SHARD line
+        lines.append("MEM " + json.dumps({"unit": name, "slots": slots, "peak_gib_max": 23.5}))
         lines.append("SHARD " + json.dumps({"unit": name, "tokens_out": tokens[k], "seconds": seconds[k],
                                             "out_per_s": round(tokens[k] / seconds[k]), "not_ended": 0,
                                             "segments": 8}))
-        lines.append("MEM " + json.dumps({"unit": name, "slots": slots, "peak_gib_max": 23.5}))
     return lines
 
 

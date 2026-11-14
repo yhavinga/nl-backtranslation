@@ -866,7 +866,8 @@ def smoke_measures(log_lines):
             starts[current].append(float(line.split()[3]))
         elif line.startswith("SHARD "):
             r = json.loads(line[len("SHARD "):])
-            units[r["unit"]] = {k: r[k] for k in ("tokens_out", "seconds", "out_per_s", "not_ended", "segments")}
+            units.setdefault(r["unit"], {}).update({k: r[k] for k in ("tokens_out", "seconds", "out_per_s",
+                                                                       "not_ended", "segments")})
         elif line.startswith("MEM "):
             r = json.loads(line[len("MEM "):])
             units.setdefault(r["unit"], {}).update(slots=r["slots"], peak_gib=r["peak_gib_max"])

@@ -124,14 +124,14 @@ judge)
       "$TOP/gemma_judge/judge.py" score --ckpt "$CKPT/0/items" --tokenizer "$JUDGE/tokenizer" --fsdp 1 \
       --tensor 4 --token-budget "$1" --task source_topic_origin --pairs "$IN" --out "$O/scores/w$K" > "$2" 2>&1
   }
-  log=~/logs/btl_judge_$RUN.log
+  log=~/logs/btl_judgerun_$RUN.log
   if ! run_judge "$budget" "$log"; then
     grep -aqE "$OOM" "$log" || { tail -n 30 "$log"; exit 1; }
-    gsutil -q cp "$log" "$O/logs/btl_judge_${RUN}_oom-w$K.log"
-    log=~/logs/btl_judge_${RUN}_b$((budget / 2)).log
+    gsutil -q cp "$log" "$O/logs/btl_judgerun_${RUN}_oom-w$K.log"
+    log=~/logs/btl_judgerun_${RUN}_b$((budget / 2)).log
     run_judge $((budget / 2)) "$log" || { tail -n 30 "$log"; exit 1; }
   fi
-  gsutil -q cp "$log" "$O/logs/btl_judge_$RUN-w$K.log"
+  gsutil -q cp "$log" "$O/logs/btl_judgerun_$RUN-w$K.log"
   grep -aE '^(DONE|model ready)' "$log"
   n_in=$(ls "$IN" | grep -c '^shard-.*\.parquet$')
   n_out=$(gsutil ls "$O/scores/w$K/" | grep -c '/shard-.*\.parquet$')
