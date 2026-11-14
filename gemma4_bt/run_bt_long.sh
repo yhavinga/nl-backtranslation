@@ -110,7 +110,7 @@ smoke)
     fi
     gsutil -q cp "$log" "$ROOT/logs/$(basename "$log" .log)-w$K.log"
     echo "$slots" | gsutil -q cp - "$ROOT/slots/$class"
-    grep -aE '^(SHARD|MEM|engine ready)' "$log" | cut -c1-300
+    grep -aE '^(SHARD|MEM|engine ready)' "$log" | cut -c1-300 || true
   done
   echo "STEP smoke OK w$K $*"
   ;;
@@ -132,9 +132,9 @@ judge)
     run_judge $((budget / 2)) "$log" || { tail -n 30 "$log"; exit 1; }
   fi
   gsutil -q cp "$log" "$O/logs/btl_judgerun_$RUN-w$K.log"
-  grep -aE '^(DONE|model ready)' "$log"
-  n_in=$(ls "$IN" | grep -c '^shard-.*\.parquet$')
-  n_out=$(gsutil ls "$O/scores/w$K/" | grep -c '/shard-.*\.parquet$')
+  grep -aE '^(DONE|model ready)' "$log" || true
+  n_in=$(ls "$IN" | grep -c '^shard-.*\.parquet$' || true)
+  n_out=$(gsutil ls "$O/scores/w$K/" | grep -c '/shard-.*\.parquet$' || true)
   [ "$n_in" = "$n_out" ] || { echo "w$K: $n_out score shards for $n_in input shards"; exit 1; }
   echo "STEP judge OK w$K $n_out shards"
   ;;
@@ -159,7 +159,8 @@ work)
         gsutil -q cp "$log" "$O/logs/$(basename "$log" .log)-failed-w$K.log" || true
         [ "${fails[$class]}" -ge 2 ] && { echo "w$K: class $class failed in two passes in a row"; exit 1; }
       fi
-      grep -aE '^(CLASS|SHARD)' "$log" | cut -c1-240 | tail -n 3
+      # the informational lines; set -e and pipefail would stop at a log without one
+      grep -aE '^(CLASS|SHARD)' "$log" | cut -c1-240 | tail -n 3 || true
     done
     st=$(py -u "$C/bt_gemma4.py" status --plan "$P" --root "$O/$plan" | tail -n 1)
     echo "STATUS $(date -u +%T) $st"
