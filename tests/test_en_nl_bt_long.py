@@ -301,3 +301,196 @@ def test_work_takes_the_slots_given_for_its_class():
     args.length_class, args.slots = "l1k", 12
     t = bg.Translator(args, plan_info)
     assert t.shapes["slots"] == 12 and t.shapes["max_decode"] == 1280
+
+
+# ---------------------------------------------------------------------------------------------------- after the selection
+
+# The columns of the published files (data/) of each -gemma4 dataset, in their order (14 Nov 2026)
+TAIL = ["en", "tokens_nl", "sentences_nl", "source_score", "origin_score", "topic", "half", "idiom_class",
+        "idiom_score", "headings_repaired", "drawn_in_pass"]
+CHECKS = ["ended", "tokens_out", "prompt", "prompt_text", "model", "hard_fails", "structure", "chatter", "decode_loop",
+          "dutch_left", "len_ratio", "numbers_missing", "word_ratio", "char_ratio", "region", "vm", "time", "nl_back",
+          "back_tokens_out", "back_ended", "chrf", "back_decode_loop", "back_english_left", "back_structure",
+          "back_chatter"]
+GPTNL = ["id", "gptnl_doc_id", "gptnl_source_id", "content_type", "content_quality", "content_integrity",
+         "pii_presence", "nl"]
+PUBLISHED = {
+    "fineweb": ["id", "fineweb2_id", "url", "host", "dump", "date", "nl"] + TAIL + CHECKS,
+    "handelingen": ["id", "handelingen_id", "url", "session_year", "meeting_number", "date", "title", "turn", "speaker",
+                    "party", "nl"] + TAIL + ["context_ids"] + CHECKS,
+    "raad": GPTNL + TAIL + ["repair_pass"] + CHECKS,
+    "dpc": GPTNL + TAIL + CHECKS,
+    "rechtspraak": GPTNL + TAIL + CHECKS,
+}
+
+
+def selected(source, i, tokens=600, split="train", order=0):
+    meta = {"fineweb": {"fineweb2_id": f"<urn:{i}>", "url": "https://a.nl/x", "host": "a.nl", "dump": "CC-MAIN-2020-10",
+                        "date": "2020-02-20T10:00:00Z"},
+            "handelingen": {"handelingen_id": f"h-{i}", "url": f"https://zoek.officielebekendmakingen.nl/h-{i}.html",
+                            "session_year": "2019-2020", "meeting_number": 3, "date": "2019-10-01", "title": "Debat",
+                            "turn": 4, "speaker": "De heer A", "party": "VVD"}}.get(source) or {
+        "gptnl_doc_id": f"g{i}", "gptnl_source_id": "s", "content_type": ["news"], "content_quality": "good",
+        "content_integrity": "complete", "pii_presence": "no_pii"}
+    return {"id": f"{source}:d{i}:d:p0-3", "source": source, "doc_id": f"d{i}", "split": split, "order": order,
+            "nl": "Dit is de eerste zin.\n\nEn dit is de tweede zin.", "tokens_nl": tokens, "headings_repaired": 0,
+            "repaired": False, "idiom_score": 0.5, "source_score": 0.99, "origin_score": 0.98, "topic": "Health and care",
+            "bin": bl.bin_of(tokens), **meta}
+
+
+def test_a_long_row_has_exactly_the_columns_of_its_dataset():
+    en = {"text_en": "This is the first sentence.\n\nAnd this is the second sentence.", "ended": True, "tokens_out": 20,
+          "prompt": "natural-v1-fmt", "region": "us-central2", "owner": "t1v-n-1-w-0/h0", "time": "2026-11-15T01:00:00Z"}
+    back = {"text_nl": "Dit is de eerste zin.\n\nEn dit is de tweede zin.", "ended": True, "tokens_out": 21}
+    for source, columns in PUBLISHED.items():
+        row = bl.long_row(source, selected(source, 1), en, back)
+        assert set(row) == set(columns), (source, set(row) ^ set(columns))
+        assert row["half"] == "random" and row["idiom_class"] is None and row["drawn_in_pass"] is None
+        assert row["hard_fails"] == [] and row["chrf"] == 100.0 and row["sentences_nl"] == 2
+        assert row["prompt_text"].startswith("Translate the following Dutch text into natural")
+    assert bl.long_row("handelingen", selected("handelingen", 1), en, back)["context_ids"] == []
+    assert bl.long_row("raad", dict(selected("raad", 1), repaired=True), en, back)["repair_pass"] is True
+
+
+def write_published(root, source, rows):
+    """A fake -gemma4 dataset of one source with the published column order"""
+    import pyarrow as pa
+
+    table = pa.Table.from_pylist(rows).select(PUBLISHED[source])
+    path = Path(root) / source / "data" / "train-00000-of-00001.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import pyarrow.parquet as pq
+
+    pq.write_table(table, path)
+
+
+def test_choose_english_and_build_make_the_new_rows_of_every_split(tmp_path):
+    import pyarrow.parquet as pq
+
+    # candidates of every source: 6 each, one validation; scores: one below the source threshold, and for FineWeb-2
+    # one below the origin threshold
+    scores = []
+    for source in bl.SOURCE_KEYS:
+        rows = [dict(selected(source, i, tokens=600 + 400 * (i % 4), split="validation" if i == 5 else "train",
+                              order=i)) for i in range(6)]
+        bg.write_parquet(rows, tmp_path / "cand" / f"{source}.parquet")
+        for i, r in enumerate(rows):
+            scores.append({"id": r["id"], "score": 0.2 if i == 1 else 0.9, "origin_score": 0.1 if i == 2 else 0.9,
+                           "topic": "D", "skipped": None})
+    bg.write_parquet(scores, tmp_path / "scores" / "w0" / "shard-00000.parquet")
+    bl.main(["choose", "--candidates", str(tmp_path / "cand"), "--scores", str(tmp_path / "scores"), "--out",
+             str(tmp_path / "sel"), "--per-source", "3"])
+    result = json.loads((tmp_path / "sel" / "selection.json").read_text())
+    assert result["sources"]["fineweb"]["reasons"] == {"eligible": 4, "source_below": 1, "origin_below": 1}
+    assert result["sources"]["raad"]["reasons"] == {"eligible": 5, "source_below": 1}
+    assert result["sources"]["raad"]["chosen"] == 3
+    chosen = bl.selection_rows(tmp_path / "sel", "raad", "train") + bl.selection_rows(tmp_path / "sel", "raad",
+                                                                                         "validation")
+    assert all(r["topic"] == "Health and care" for r in chosen)
+    # the English and the round trip of every chosen passage, as the units' shards
+    en_rows, rt_rows = [], []
+    for source in bl.SOURCE_KEYS:
+        for split in bg.SPLITS:
+            for r in bl.selection_rows(tmp_path / "sel", source, split):
+                en_rows.append({"id": r["id"], "text_en": "This is the first sentence.\n\nAnd this is the second.",
+                                "ended": True, "tokens_in": 9, "tokens_out": 12, "unit": f"{source}/{split}-l640-0000",
+                                "prompt": "natural-v1-fmt", "owner": "w-0/h0", "region": "us-central2",
+                                "time": "2026-11-15T01:00:00Z"})
+                rt_rows.append({"id": r["id"], "text_nl": r["nl"], "ended": True, "tokens_in": 9, "tokens_out": 13,
+                                "unit": "x", "prompt": "natural-v1-fmt", "owner": "w-0/h0", "region": "us-central2",
+                                "time": "2026-11-15T02:00:00Z"})
+    bg.write_parquet(en_rows, tmp_path / "en-shards" / "shards" / "a.parquet")
+    bg.write_parquet(rt_rows, tmp_path / "rt-shards" / "shards" / "a.parquet")
+    bl.main(["english", "--selection", str(tmp_path / "sel"), "--shards", str(tmp_path / "en-shards"), "--out",
+             str(tmp_path / "english")])
+    eng = pq.read_table(tmp_path / "english" / "dpc" / "data" / "train-00000-of-00001.parquet")
+    assert eng.column_names == ["id", "nl", "en", "tokens_nl"]
+    en = {"text_en": "x", "ended": True, "tokens_out": 1, "prompt": "natural-v1-fmt", "region": "r", "owner": "o",
+          "time": "t"}
+    for source in bl.SOURCE_KEYS:
+        write_published(tmp_path / "existing", source, [bl.long_row(source, selected(source, 9), en,
+                                                                    {"text_nl": "y", "ended": True, "tokens_out": 1})])
+    (tmp_path / "existing" / "heads.json").write_text(json.dumps({s: "abc" for s in bl.SOURCE_KEYS}))
+    bl.main(["build", "--selection", str(tmp_path / "sel"), "--existing", str(tmp_path / "existing"), "--en-shards",
+             str(tmp_path / "en-shards"), "--rt-shards", str(tmp_path / "rt-shards"), "--out", str(tmp_path / "build")])
+    built = json.loads((tmp_path / "build" / "build.json").read_text())
+    assert built["rows"]["fineweb/train"] + built["rows"]["fineweb/validation"] == 3
+    table = pq.read_table(tmp_path / "build" / "handelingen" / "data" / "train.parquet")
+    assert table.column_names == PUBLISHED["handelingen"]
+    assert built["stats"]["raad/train"]["n"] == built["rows"]["raad/train"]
+    # a chosen passage without its round trip stops the build
+    bg.write_parquet(rt_rows[1:], tmp_path / "rt2" / "a.parquet")
+    with pytest.raises(SystemExit, match="no English or no round trip"):
+        bl.main(["build", "--selection", str(tmp_path / "sel"), "--existing", str(tmp_path / "existing"),
+                 "--en-shards", str(tmp_path / "en-shards"), "--rt-shards", str(tmp_path / "rt2"), "--out",
+                 str(tmp_path / "b2")])
+    # an English twice stops the round trip's input
+    bg.write_parquet(en_rows[:1], tmp_path / "en-shards" / "shards" / "b.parquet")
+    with pytest.raises(SystemExit, match="twice in the shards"):
+        bl.main(["english", "--selection", str(tmp_path / "sel"), "--shards", str(tmp_path / "en-shards"), "--out",
+                 str(tmp_path / "e2")])
+
+
+def test_smoke_plan_has_two_units_a_class_of_the_longest_passages_it_holds(tmp_path):
+    for source in bl.SOURCE_KEYS:
+        rows = [selected(source, i, tokens=t, order=i) for i, t in enumerate(range(513, 2049, 2))]
+        bg.write_parquet(rows, tmp_path / "cand" / f"{source}.parquet")
+    bl.main(["smokeplan", "--candidates", str(tmp_path / "cand"), "--out", str(tmp_path / "smoke")])
+    for name, model in (("smoke-nl", bl.MODEL), ("smoke-rt", bl.RT_MODEL)):
+        info = bg.load_plan(tmp_path / "smoke" / name)
+        m = ge.MODELS[model]
+        assert [u["name"] for u in info["units"]] == [f"smoke/train-{c}-{k:04d}" for c in m["length_classes"]
+                                                     for k in range(bl.SMOKE_UNITS)]
+        for u in info["units"]:
+            rows = bg.read_rows(tmp_path / "smoke" / name / u["segments"])
+            assert len(rows) == bl.SMOKE_PER_SLOT * m["slots"][u["class"]] == u["n"]
+            assert max(r["tokens"] for r in rows) <= m["length_classes"][u["class"]]["max_source"]
+    assert bg.languages(bg.load_plan(tmp_path / "smoke" / "smoke-rt")) == ("en", "nl")
+    # the nl->en classes get passages of their own length range
+    info = bg.load_plan(tmp_path / "smoke" / "smoke-nl")
+    rows = bg.read_rows(tmp_path / "smoke" / "smoke-nl" / info["units"][-1]["segments"])
+    assert min(r["tokens"] for r in rows) > 1792
+
+
+def smoke_log(cls, units, slots, tokens=(1000, 1000), seconds=(20.0, 10.0)):
+    lines = [f"MAXTEXT {json.dumps({'class': cls})}", "engine ready in 50 s"]
+    for k in range(units):
+        name = f"smoke/train-{cls}-{k:04d}"
+        lines.append("SHARD " + json.dumps({"unit": name, "tokens_out": tokens[k], "seconds": seconds[k],
+                                            "out_per_s": round(tokens[k] / seconds[k]), "not_ended": 0,
+                                            "segments": 8}))
+        lines.append("MEM " + json.dumps({"unit": name, "slots": slots, "peak_gib_max": 23.5}))
+    return lines
+
+
+def test_smoke_measures_give_the_steady_speed_compilation_and_start_per_class():
+    units, starts = bl.smoke_measures(smoke_log("l2k", 2, 4))
+    rates = bl.class_rates(units, starts)
+    # steady 100 tokens/s; the first unit's 1000 tokens took 20 s, 10 of them compilation
+    assert rates["l2k"] == {"out_per_s": 100.0, "compile_s": 10.0, "start_s": 50.0, "slots": 4, "peak_gib": 23.5,
+                            "not_ended": 0, "segments": 16}
+    with pytest.raises(SystemExit, match="2 needed"):
+        bl.class_rates(*bl.smoke_measures(smoke_log("l2k", 1, 4)))
+
+
+def test_the_budget_lowers_the_passages_per_source_until_the_estimate_fits(tmp_path):
+    nl = {c: {"out_per_s": 100.0, "compile_s": 60.0, "start_s": 100.0} for c in ge.MODELS[bl.MODEL]["length_classes"]}
+    rt = {c: {"out_per_s": 100.0, "compile_s": 60.0, "start_s": 100.0} for c in ge.MODELS[bl.RT_MODEL]["length_classes"]}
+    out_ratio = {c: 0.8 for c in nl}
+    rows = [{"id": str(i), "tokens_nl": 1000} for i in range(10)]
+    est = bl.estimate(rows, nl, rt, out_ratio, 1.0, workers=8)
+    # 10 x (800 / 100 + 1000 / 100) s of decoding; one class each way, 160 s each, on 8 workers
+    assert est["decode_worker_hours"] == round(180 / 3600, 2) and est["fixed_worker_hours"] == round(2 * 160 * 8 / 3600, 2)
+    smoke = {"nl": nl, "rt": rt, "out_ratio": out_ratio}
+    (tmp_path / "smoke.json").write_text(json.dumps(smoke))
+    (tmp_path / "report.json").write_text(json.dumps({"back_ratio": 1.0}))
+    for source in bl.SOURCE_KEYS:
+        bg.write_parquet([{"id": f"{source}{i}", "tokens_nl": 2000, "order": i} for i in range(1000)],
+                         tmp_path / "sel" / source / "data" / "train-00000-of-00001.parquet")
+    # per passage (1600 + 2000) / 100 = 36 s; 5 sources x n x 36 s + 2 x 160 x 8 s <= 2 worker-hours: n <= 25
+    bl.main(["budget", "--smoke", str(tmp_path / "smoke.json"), "--report", str(tmp_path / "report.json"),
+             "--selection", str(tmp_path / "sel"), "--worker-hours", "2", "--step", "5", "--out",
+             str(tmp_path / "budget.json")])
+    b = json.loads((tmp_path / "budget.json").read_text())
+    assert b["n"] == 25 and b["per_source"] == {s: 25 for s in bl.SOURCE_KEYS} and b["target"] == 1000
+    assert b["estimate"]["worker_hours"] <= 2

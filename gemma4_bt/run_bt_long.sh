@@ -14,6 +14,11 @@
 #   $O/judge-in/w<k> into $O/scores/w<k>; out of memory: again with half the token budget.
 # work: the plan $O/<plan>/plan, its classes in the order given, claims and shards under $O/<plan>/, the slots of
 #   $O/slots.json; until the plan is complete (bt_gemma4.py status), every worker of every VM taking free units.
+# CPU steps, on one worker (the control machine runs each once, under a lock in the bucket):
+#   measure: smoke.json (bt_long.py smoke-measures) and slots.json from ROOT, the first VM's smoke test
+#   plan: choose at the target, budget, choose within it, the nl->en plan (bt_gemma4.py plan) to $O/nl-en/plan
+#   rtplan: the English of the nl->en shards (bt_long.py english) and the round trip's plan to $O/rt/plan
+#   build: the -gemma4 datasets at the heads the candidates read, the new rows (bt_long.py build) to $O/build
 # Every step ends with a line "STEP <name> OK" or exits non-zero. Needs ~/.cache/huggingface/token.
 set -euo pipefail
 O=${O:?set O to the gs:// directory of the run}
@@ -26,8 +31,11 @@ C=$(cd "$(dirname "$0")" && pwd)
 TOP=$(dirname "$C")
 K=$(hostname | sed 's/.*-w-//')
 TOK=$SHM/tokenizer-gemma4
-ZONE=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}')
-REGION=${ZONE%-*}
+JUDGE=${JUDGE:-/dev/shm/judge}  # gemma_judge/setup.sh's environment
+PARTS=fineweb,handelingen,raad,dpc,rechtspraak
+WORKER_HOURS=${WORKER_HOURS:-96}
+TARGET=${TARGET:-5000}
+region() { local zone; zone=$(curl -fs -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/zone | awk -F/ '{print $NF}'); echo "${zone%-*}"; }
 export XLA_FLAGS=--xla_dump_hlo_as_text=false TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 HF_HUB_DISABLE_PROGRESS_BARS=1
 # The host's 4 chips as one process: without these JAX takes the slice from the metadata and waits for the other hosts
 export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_CHIPS=0,1,2,3 TPU_PROCESS_PORT=8476
@@ -57,7 +65,7 @@ slots_of() {  # model class: the slots of models.yml (or its fallback_slots with
 work_class() {  # plan root class slots log: bt_gemma4.py work on one class; the exit code
   local plan=$1 root=$2 class=$3 slots=$4 log=$5
   py -u "$C/bt_gemma4.py" work --plan "$plan" --root "$root" --length-class "$class" --prompt "$PROMPT" \
-    --direction forward --owner "$(hostname)/h0" --run "$RUN" --region "$REGION" --tokenizer "$TOK" \
+    --direction forward --owner "$(hostname)/h0" --run "$RUN" --region "$(region)" --tokenizer "$TOK" \
     --ckpt "$CKPT/0/items" --work-dir "$SHM/work" --slots "$slots" > "$log" 2>&1
 }
 
@@ -112,8 +120,8 @@ judge)
   gsutil -m -q rsync "$O/judge-in/w$K" "$IN"
   budget=${TOKEN_BUDGET:-16384}
   run_judge() {
-    JUDGE_JAX_CACHE=$SHM/judge-jax-cache TPU_LOG_DIR=$SHM/tpu_logs /dev/shm/judge/venv/bin/python -u \
-      "$TOP/gemma_judge/judge.py" score --ckpt "$CKPT/0/items" --tokenizer /dev/shm/judge/tokenizer --fsdp 1 \
+    JUDGE_JAX_CACHE=$SHM/judge-jax-cache TPU_LOG_DIR=$SHM/tpu_logs "$JUDGE/venv/bin/python" -u \
+      "$TOP/gemma_judge/judge.py" score --ckpt "$CKPT/0/items" --tokenizer "$JUDGE/tokenizer" --fsdp 1 \
       --tensor 4 --token-budget "$1" --task source_topic_origin --pairs "$IN" --out "$O/scores/w$K" > "$2" 2>&1
   }
   log=~/logs/btl_judge_$RUN.log
@@ -159,6 +167,79 @@ work)
   done
   echo "STEP work OK w$K $plan"
   ;;
+measure)
+  ROOT=${ROOT:?set ROOT to the gs:// directory of the smoke test of this VM}
+  W=$SHM/measure-$RUN
+  mkdir -p "$W/logs" "$W/shards" "$W/candidates"
+  gsutil -m -q rsync -r "$O/candidates" "$W/candidates"
+  gsutil -m -q rsync -r "$ROOT/logs" "$W/logs"
+  gsutil -m -q rsync -r "$ROOT/smoke-nl/shards" "$W/shards"
+  py -u "$C/bt_long.py" smoke-measures --logs "$W"/logs/*.log --shards "$W/shards" --candidates "$W/candidates" \
+    --out "$W/smoke.json"
+  mkdir -p "$W/slots"
+  gsutil -m -q rsync -r "$ROOT/slots" "$W/slots"
+  py - "$W/slots" "$C/models.yml" > "$W/slots.json" <<'PYEOF'
+import json, os, sys
+import yaml
+models = yaml.safe_load(open(sys.argv[2]))["models"]
+slots = {k: int(open(os.path.join(sys.argv[1], k)).read()) for k in sorted(os.listdir(sys.argv[1]))}
+wanted = [c for m in ("gemma4-31b-bt-long", "gemma4-31b-rt-long") for c in models[m]["length_classes"]]
+missing = [c for c in wanted if c not in slots]
+if missing:
+    sys.exit(f"no slots measured for {missing}")
+print(json.dumps(slots))
+PYEOF
+  # once: the first VM's measures stand; a later smoke test only checks its own VM
+  gsutil -q -h x-goog-if-generation-match:0 cp "$W/smoke.json" "$O/smoke.json" || echo "smoke.json was there"
+  gsutil -q -h x-goog-if-generation-match:0 cp "$W/slots.json" "$O/slots.json" || echo "slots.json was there"
+  cat "$W/slots.json"
+  echo "STEP measure OK"
+  ;;
+plan)
+  W=$SHM/plan-$RUN
+  mkdir -p "$W/candidates" "$W/scores"
+  gsutil -m -q rsync -r "$O/candidates" "$W/candidates"
+  gsutil -m -q rsync -r "$O/scores" "$W/scores"
+  gsutil -q cp "$O/smoke.json" "$W/smoke.json"
+  py -u "$C/bt_long.py" choose --candidates "$W/candidates" --scores "$W/scores" --per-source "$TARGET" --out "$W/at-target"
+  py -u "$C/bt_long.py" budget --smoke "$W/smoke.json" --report "$W/candidates/report.json" --selection "$W/at-target" \
+    --worker-hours "$WORKER_HOURS" --out "$W/budget.json"
+  py -u "$C/bt_long.py" choose --candidates "$W/candidates" --scores "$W/scores" --budget "$W/budget.json" \
+    --out "$W/selection"
+  py -u "$C/bt_gemma4.py" plan --data "$W/selection" --model gemma4-31b-bt-long --parts "$PARTS" --expect 0 \
+    --check-prompt "$PROMPT" --tokenizer "$TOK" --out "$W/plan"
+  gsutil -m -q rsync -r "$W/selection" "$O/selection"
+  gsutil -q cp "$W/budget.json" "$O/budget.json"
+  gsutil -m -q rsync -r "$W/plan" "$O/nl-en/plan"
+  echo "STEP plan OK $(py -c "import json, sys; d = json.load(open(sys.argv[1])); print(len(d['units']), 'units,', d['passages'], 'passages, hash', d['hash'])" "$W/plan/units.json")"
+  ;;
+rtplan)
+  W=$SHM/rtplan-$RUN
+  mkdir -p "$W/selection" "$W/shards"
+  gsutil -m -q rsync -r "$O/selection" "$W/selection"
+  gsutil -m -q rsync -r "$O/nl-en/shards" "$W/shards"
+  py -u "$C/bt_long.py" english --selection "$W/selection" --shards "$W/shards" --out "$W/english"
+  py -u "$C/bt_gemma4.py" plan --data "$W/english" --text en --model gemma4-31b-rt-long --parts "$PARTS" --expect 0 \
+    --check-prompt "$PROMPT" --tokenizer "$TOK" --out "$W/plan"
+  gsutil -m -q rsync -r "$W/plan" "$O/rt/plan"
+  echo "STEP rtplan OK $(py -c "import json, sys; d = json.load(open(sys.argv[1])); print(len(d['units']), 'units,', d['passages'], 'passages, hash', d['hash'])" "$W/plan/units.json")"
+  ;;
+build)
+  W=$SHM/build-$RUN
+  mkdir -p "$W/candidates" "$W/selection" "$W/en" "$W/rt"
+  gsutil -q cp "$O/candidates/report.json" "$W/candidates/report.json"
+  py -c "import json, sys; json.dump(json.load(open(sys.argv[1]))['heads'], open(sys.argv[2], 'w'))" \
+    "$W/candidates/report.json" "$W/heads.json"
+  HF_HUB_OFFLINE=0 py -u "$C/bt_long.py" fetch --heads "$W/heads.json" --out "$W/existing"
+  gsutil -m -q rsync -r "$O/selection" "$W/selection"
+  gsutil -m -q rsync -r "$O/nl-en/shards" "$W/en"
+  gsutil -m -q rsync -r "$O/rt/shards" "$W/rt"
+  py -u "$C/bt_long.py" build --selection "$W/selection" --existing "$W/existing" --en-shards "$W/en" \
+    --rt-shards "$W/rt" --out "$W/build"
+  gsutil -m -q rsync -r "$W/build" "$O/build"
+  echo "STEP build OK"
+  ;;
 *)
-  echo "usage: run_bt_long.sh setup | smoke <plan> <class>... | judge | work <plan> <class>..."; exit 1 ;;
+  echo "usage: run_bt_long.sh setup | smoke <plan> <class>... | judge | work <plan> <class>... | measure | plan | rtplan | build"
+  exit 1 ;;
 esac
