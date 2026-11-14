@@ -72,7 +72,8 @@ devtest, WMT24++ en-nl_NL and NTREX-128, each at a fixed revision. They are read
 Software: MaxText 0.2.5 (both models run in MaxText on TPU), JAX 0.11.1, `tokenizers` 0.23.2, `sacrebleu` 2.5.1,
 `langid` 1.1.6 (the versions `setup.sh` installs). `gemma4_bt/` runs Gemma 4 in MaxText from git: commit `2249474` of
 [github.com/yhavinga/maxtext](https://github.com/yhavinga/maxtext) (MaxText's main of 9 Nov 2026, `d1c0d0a`, with the
-NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/setup.sh`.
+NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/setup.sh`; the long passages use
+commit `f4d8615` of the same fork (branch `fix-decode-cache-shared-index`: one index into the decode cache per slot).
 
 ## Files
 
@@ -92,6 +93,7 @@ NNX decode cache made from shapes inside the init jit), installed by `gemma4_bt/
 | `gemma4_bt/gemma4_engine.py`, `gemma4_bt/models.yml` | Gemma 4 31B-it in MaxText on 4 chips (greedy, continuous batching); the prompts, the length classes and the decode slots of both directions |
 | `gemma4_bt/run_bt_gemma4.sh`, `gemma4_bt/setup.sh` | all steps on one v6e-8 VM, as two processes of 4 chips (`all`, or `roundtrip`), or with `ONE_PROCESS=1` on each worker of a v4-32 as one process of its 4 chips (`CLAIMS`: claims in another region's directory, `work --claims-root`); its environment in `/dev/shm/bt_gemma4` |
 | `gemma4_bt/keeper.sh`, `gemma4_bt/stage.sh` | on a control machine: the spot VMs of every region requested, started, restarted and deleted, and the units of the other regions announced; the code put into each region's bucket |
+| `gemma4_bt/bt_long.py`, `gemma4_bt/run_bt_long.sh` | the long passages of the `-gemma4` datasets (513-2,048 tokens): their selection (`fetch`, `candidates`, `judge-shards`, `choose`), the smoke test and the budget of the run (`smokeplan`, `smoke-measures`, `budget`), the round trip's input (`english`) and the new rows (`build`); the TPU and CPU steps on a worker of a v4-32 |
 | `tests/` | tests on made-up data; no network, model or TPU |
 
 ## Requirements
@@ -305,6 +307,47 @@ output.
 
 The length of a passage is a setting: a set of longer passages needs length classes of its own in `models.yml` (a new
 model entry) and `bt_gemma4.py plan --model <entry> --max-source <tokens>`.
+
+### Long passages
+
+`gemma4_bt/bt_long.py` adds passages of more than 512 and at most 2,048 Gemma 4 tokens to the five `-gemma4`
+datasets, as rows of their splits with the same columns; every existing row has at most 512 tokens, so `tokens_nl` >
+512 marks them. A long passage is translated whole, in one prompt (a length trial found whole passages up to 2,048
+tokens translated as well as the same passages in pieces of about 512 tokens, and longer ones worse).
+
+- **Selection** (`candidates`, CPU). The documents of the same sources (`select_passages.SOURCES`; FineWeb-2 only
+  from the crawls up to CC-MAIN-2023-23), read in an order fixed by a seed, through the selection's document filters.
+  A passage is a stretch of whole consecutive paragraphs of one block (a speaker's turn in the Handelingen, the
+  document otherwise), as many as fit 2,048 tokens after the two edits of the selection, from one of a few random
+  starts; it shares no paragraph with a passage or context turn of the datasets in the same document (located by
+  their text; a document where a passage cannot be found is skipped), passes the selection's filters on the whole
+  text and its extraction rules on every paragraph, has at least 60% of its tokens in prose paragraphs and no table
+  row or address, and shares no 13-gram of words with a test set, with any passage of the datasets or with a long
+  passage chosen before. At most one per document, 25 per FineWeb-2 host. The split is the document's: that of its
+  existing rows, else the selection's rule (`select_passages.split_of`, 20 per mille). `candidates` also checks this
+  reconstruction against the existing rows (the split rule, the idiom score and the sentence count).
+- **Judge and choice** (`judge-shards`, `gemma_judge/judge.py` task `source_topic_origin`, `choose`). The source
+  score, origin score and topic of every candidate, the thresholds of the selection (source score >= 0.5; FineWeb-2
+  also origin score >= 0.5), and the same number of passages from each of four length bins (513-896, 897-1,280,
+  1,281-1,664 and 1,665-2,048 tokens; a bin short of it leaves the rest to the others), FineWeb-2's topics capped
+  at 15% while enough are left. `half` is `random`, `idiom_class` and `drawn_in_pass` are null.
+- **Translation.** `bt_gemma4.py` with the models `gemma4-31b-bt-long` (nl->en: seven length classes up to 2,048
+  tokens, decode limit 1.25 times the class's bound) and `gemma4-31b-rt-long` (the round trip: classes of the
+  English's tokens whose decode limit holds 1.25 times the Dutch, `move_up`), the prompt `natural-v1-fmt`, on the
+  MaxText fork at `f4d8615` (branch `fix-decode-cache-shared-index`, `FORK_COMMIT` of `gemma4_bt/setup.sh`): before
+  that commit all decode slots shared one index into the cache, and a passage in a slot used before lost the newest
+  tokens from Gemma 4's sliding window of 1,024 once its decode ran past the end of the cache. The slots of every
+  class come from peak memory measured on a v4 chip (`models.yml`); `smokeplan` and `smoke-measures` measure every
+  class's speed and memory on the TPU first, a class out of memory runs with its `fallback_slots`, and `budget` lowers
+  the number of passages per source (the same for all) until the estimate of the run fits a number of worker-hours.
+- **The rows** (`english`, `build`). The English of the nl->en shards as the round trip's input, and every new row
+  in the schema and column order of the dataset's files, with the checks of `bt_gemma4.py`: `id` is
+  `<source>:<document>:<block>:p<first>-<last>` (the range of the block's paragraphs, from 0).
+
+`gemma4_bt/run_bt_long.sh` runs the steps on a worker of a TPU v4-32, each worker one process of its 4 chips
+(`setup`, `smoke`, `judge`, `work` on the TPU; `measure`, `plan`, `rtplan`, `build` on the CPU); a control machine
+starts them on every worker and runs the steps that happen once under a lock object in the bucket, so that the
+workers of two VMs share the units.
 
 ## Tests
 

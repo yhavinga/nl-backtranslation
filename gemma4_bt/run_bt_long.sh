@@ -144,19 +144,20 @@ work)
   mkdir -p "$P"
   gsutil -m -q rsync -r "$O/$plan/plan" "$P"
   gsutil -q cp "$O/slots.json" "$SHM/slots.json"
-  fails=0
+  declare -A fails
   while true; do
     for class in "$@"; do
       slots=$(py -c "import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$SHM/slots.json" "$class")
       log=~/logs/btl_work_${plan}_${class}_$RUN.log
       [ -e "$log" ] && log=~/logs/btl_work_${plan}_${class}_${RUN}_$(date +%s).log
       if work_class "$P" "$O/$plan" "$class" "$slots" "$log"; then
-        fails=0
+        fails[$class]=0
       else
-        fails=$((fails + 1))
+        # the claim stays this worker's: the next pass takes the same unit again; a class failing twice in a row stops
+        fails[$class]=$(( ${fails[$class]:-0} + 1 ))
         tail -n 30 "$log"
         gsutil -q cp "$log" "$O/logs/$(basename "$log" .log)-failed-w$K.log" || true
-        [ $fails -ge 2 ] && { echo "w$K: two passes in a row failed ($class)"; exit 1; }
+        [ "${fails[$class]}" -ge 2 ] && { echo "w$K: class $class failed in two passes in a row"; exit 1; }
       fi
       grep -aE '^(CLASS|SHARD)' "$log" | cut -c1-240 | tail -n 3
     done
