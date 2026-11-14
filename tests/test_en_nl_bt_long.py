@@ -505,3 +505,12 @@ def test_contains_any_finds_a_value_of_a_sorted_array():
     assert bl.contains_any(a, np.array([2 ** 63 + 5], dtype=np.uint64))
     assert not bl.contains_any(a, np.array([0, 11, 2 ** 64 - 1], dtype=np.uint64))
     assert not bl.contains_any(a, np.array([], dtype=np.uint64))
+
+
+def test_the_numbers_of_a_split_whose_every_row_fails_a_check_have_no_chrf_without_them():
+    rows = [{"chrf": 60.0 + i, "hard_fails": ["len_ratio"], "back_ended": True, "back_decode_loop": False,
+             "back_english_left": False, "back_chatter": False, "back_structure": [], "nl_back": "Ja.", "en": "Yes.",
+             "back_tokens_out": 3} for i in range(3)]
+    stats = bl.long_stats(rows)
+    assert stats["n"] == 3 and stats["chrf_without_hard_fails"] is None and stats["chrf"]["p50"] == 61.0
+    assert bl.long_stats([dict(rows[0], hard_fails=[])] + rows[1:])["chrf_without_hard_fails"]["n"] == 1

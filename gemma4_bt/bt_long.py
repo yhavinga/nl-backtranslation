@@ -1095,6 +1095,16 @@ def long_row(source, sel, en, back):
     return row
 
 
+def long_stats(rows):
+    """bt_gemma4.roundtrip_stats of the rows; a split whose every row fails a hard check has no chrF without them
+    (null) instead of no numbers at all"""
+    if any(not r["hard_fails"] for r in rows):
+        return bg.roundtrip_stats(rows)
+    stats = bg.roundtrip_stats([dict(r, hard_fails=[]) for r in rows])
+    stats["chrf_without_hard_fails"] = None
+    return stats
+
+
 def build(args):
     """The new rows of every source and split (<out>/<source>/data/{split}.parquet) with the schema and column
     order of the existing files (--existing: the -gemma4 datasets the rows join), and build.json"""
@@ -1129,7 +1139,7 @@ def build(args):
                 raise SystemExit(f"{path}: the schema differs from the dataset's")
             result["rows"][f"{source}/{split}"] = len(rows)
             if rows:
-                stats = bg.roundtrip_stats(rows)
+                stats = long_stats(rows)
                 stats["hard"] = sum(bool(r["hard_fails"]) for r in rows)
                 stats["checks"] = dict(collections.Counter(c for r in rows for c in r["hard_fails"]))
                 stats["not_ended"] = sum(not r["ended"] for r in rows)
